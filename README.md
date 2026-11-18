@@ -1,54 +1,105 @@
 # Paged KV-Cache Manager with Radix Prefix Sharing
 
-EE538 Final Project (USC, Fall 2026), Track B: LLM/MLSys module, C++17.
+EE538 Final Project, USC Fall 2026. C++17, Track B.
 
-This project implements a KV-cache manager like the ones used in LLM serving systems.
-KV memory comes from a pool of fixed-size blocks, and each sequence maps its tokens to
-blocks through a block table. A radix tree over token prefixes lets requests that share
-a prompt prefix reuse the same physical blocks. A shared, partially filled block is
-copied on write before one sequence appends to it. When the pool hits its capacity
-limit, the manager evicts cached prefixes using a configurable policy (LRU or FIFO,
-with RLT as a stretch goal).
+The project studies fixed-size KV storage, prefix sharing and capacity-limited
+eviction using deterministic byte payloads rather than a running language model.
+See the [proposal](EE538_Final_Project_Proposal.pdf) for the agreed scope.
 
-## Team
+| Member | Responsibility |
+|---|---|
+| Bohan Cui | Block pool/tables, reference counts, copy-on-write, indexed template heap |
+| Bowen Deng | Radix prefix index, LRU/FIFO eviction |
+| Yingtao Yang | Manager, CLI, reference model, workloads and experiment integration |
 
-| Member       | Responsibilities                                                                                                     |
-|--------------|----------------------------------------------------------------------------------------------------------------------|
-| Bohan Cui    | Block pool, block tables, reference counting, copy-on-write, `MinHeap<T, Compare>`                                   |
-| Bowen Deng   | Radix prefix index, eviction policies                                                                                |
-| Yingtao Yang | `KVCacheManager` facade, trace driver/CLI, reference model, workload generator, experiments; integration lead        |
+The storage library and `block_demo` run independently. The `kvcache` entry point
+is still a placeholder; the complete manager, radix index, policies and experiments
+require team integration.
 
-## Status
+## Build and test
 
-Proposal stage, see [docs/proposal.pdf](docs/proposal.pdf).
-
-## Build
-
-Normal (Release) build:
+Requires a C++17 compiler and Make; Python 3 is used only for extra input tests.
 
 ```sh
-cmake -S . -B build
+make test
+./build-make/block_demo tests/golden/block_demo.in
+make sanitize
+python3 tests/demo_errors.py build-asan-make/block_demo
+```
+
+With CMake installed, the equivalent build is:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/kvcache
+(cd build && ctest --output-on-failure)
+./build/block_demo tests/golden/block_demo.in
 ```
 
-Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer):
+Use `-DKV_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug` in a separate CMake build directory
+to enable AddressSanitizer and UndefinedBehaviorSanitizer.
 
-```sh
-cmake -S . -B build-asan -DKV_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-asan
-./build-asan/kvcache
-```
+## Storage API
 
-## Directory layout
+| Component | Interface and behavior |
+|---|---|
+| `BlockPool` | Owns preallocated bytes; `allocate`, `clone`, `retain`, `release`, `read_token`. Exhaustion returns `nullopt`. |
+| `BlockTable` | Maps a request to blocks; `append`, `fork`, `from_prefix`, `read_token`, `clear`. Capacity failure on one append returns false without changing stored state. |
+| `MinHeap<T, Compare>` | Custom indexed heap; `push`, `top`, `pop`, `update`, `erase`. Lower priority wins, then lower key. |
 
-```
-include/kvcache/   public headers
-src/               implementation sources and main.cpp (CLI)
-tests/             unit tests
-tests/golden/      golden traces and expected outputs
-scripts/           workload generation and plotting scripts
-results/raw/       raw experiment output (CSV files are git-ignored)
-results/figures/   generated figures
-docs/              proposal, design notes, and report
-```
+Construct the pool before tables/indexes and destroy it last. Each table entry
+owns one reference; `clear` and destruction release it. IDs returned by `blocks()`
+are borrowed, and freed IDs may be recycled. Pool copying/moving and table copying
+are disabled; use `fork` to share or move a table to transfer its ownership.
+
+Each payload contains exactly the configured bytes per token. An exclusive partial
+tail is appended in place; a shared partial tail is copied first; a full tail needs
+a new block. Full blocks are immutable. Invalid payloads/geometry throw
+`invalid_argument`, invalid reads/IDs throw `out_of_range`, and prohibited writes
+throw `logic_error`. Operations are single-threaded.
+
+Only full blocks may enter the prefix index. The index must retain/release its own
+references. With exactly one cache-owned reference per block, a count of one means
+cache-only ownership; eviction must also respect leaf/ancestor constraints. Radix
+edge splits must preserve ownership. The manager handles multi-token admission
+prechecks and eviction rollback; single-append atomicity does not provide that
+larger transaction. The heap comparator must not throw and priorities must support
+non-throwing moves. LRU/FIFO policies decide heap eligibility and update its ranks.
+
+## Validation and complexity
+
+Tests check pool accounting, payload isolation, ownership, capacity failure, moves,
+cached prefixes and heap invariants. They include 27,000 seeded storage steps against
+independent payload vectors, 30,000 heap steps against a scan-based reference,
+16-token/64-byte storage, and a 4,097-entry heap with 64-bit priorities. Seeds are
+538, 2026 and 17; random steps include no-op choices. Golden demo output and 12 extra
+input/error cases are included. The demo reads a prompt length (0–7), its byte values,
+then one append byte; it uses four blocks of two tokens and prints both request states.
+
+Validated on macOS 14.3/arm64 with Apple Clang 15.0.0 and Make 3.81. Release uses
+`-std=c++17 -O2 -Wall -Wextra -Wpedantic`; a fresh build also passed `-Werror`.
+ASan/UBSan builds use `-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer`
+and passed without reported errors. Ubuntu/GCC and the CMake path have not been run
+here. These checks cover storage, not the full manager or a process-wide leak audit.
+
+Let C be pool capacity, B tokens/block, P bytes/token, L blocks/request and H heap
+entries. Pool construction costs O(CBP) time/space. Allocate zeroes a block and clone
+copies it: O(BP). Retain/release are O(1); an exclusive append is O(P), COW O(BP).
+Table growth can copy O(L) IDs, amortized O(1) per added ID. Fork/import/clear are O(L).
+The heap uses O(H) space and O(log H) repair comparisons, with expected O(1) hash
+lookups; growth/rehashing is amortized and adversarial collisions worsen the bounds.
+Pool payload capacity excludes metadata and allocator overhead. No model-serving
+speedup or full-project performance result is claimed.
+
+## References and assistance
+
+- Kwon et al., *Efficient Memory Management for Large Language Model Serving with
+  PagedAttention*, SOSP 2023, doi:10.1145/3600006.3613165.
+- Zheng et al., *SGLang: Efficient Execution of Structured Language Model Programs*,
+  NeurIPS 2024.
+- EE538 Fall 2026 Final Project assignment.
+
+Codex assisted with the storage implementation, tests and documentation. The custom
+pool, COW and heap code use STL containers for supporting storage; reference scans
+and sorting are used only in tests. The team is responsible for reviewing the work
+and explaining the implementation and results.

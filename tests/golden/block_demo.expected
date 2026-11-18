@@ -1,0 +1,8 @@
+parent blocks=[0,1] values=[10,11,12]
+fork blocks=[0,1] values=[10,11,12]
+append=OK copies=1
+parent blocks=[0,1] values=[10,11,12]
+child blocks=[0,2] values=[10,11,12,13]
+after parent release: free=2
+child blocks=[0,2] values=[10,11,12,13]
+after child release: free=4
