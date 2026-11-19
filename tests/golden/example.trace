@@ -1,0 +1,5 @@
+# Proposal Section 2 example: block_tokens=2, capacity_blocks=4
+ADMIT r1 10 11 12
+FORK r2 r1
+APPEND r2 13
+RELEASE r1

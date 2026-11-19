@@ -50,3 +50,10 @@ manager-test: $(BUILD)/manager_tests
 # recipe above compiles $(DRIVER); this line makes it rebuild when they change.
 DRIVER = src/trace.cpp $(MANAGER)
 $(BUILD)/kvcache: $(DRIVER)
+
+# Golden trace: the proposal example must reproduce its expected output exactly.
+.PHONY: trace-test
+test: trace-test
+trace-test: $(BUILD)/kvcache
+	./$(BUILD)/kvcache --config tests/golden/example.cfg --trace tests/golden/example.trace > $(BUILD)/example.actual
+	diff -u tests/golden/example.expected $(BUILD)/example.actual
