@@ -18,7 +18,7 @@ $(BUILD)/block_demo: examples/block_demo.cpp $(CORE) $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
 
 $(BUILD)/kvcache: src/main.cpp $(CORE) $(HEADERS) | $(BUILD)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $(DRIVER) $< -o $@
 
 test: all
 	./$(BUILD)/storage_tests
@@ -45,3 +45,8 @@ $(BUILD)/manager_tests: tests/manager_tests.cpp $(MANAGER) $(CORE) $(HEADERS) | 
 
 manager-test: $(BUILD)/manager_tests
 	./$(BUILD)/manager_tests
+
+# Sources the kvcache driver needs besides main.cpp and $(CORE). The kvcache
+# recipe above compiles $(DRIVER); this line makes it rebuild when they change.
+DRIVER = src/trace.cpp $(MANAGER)
+$(BUILD)/kvcache: $(DRIVER)

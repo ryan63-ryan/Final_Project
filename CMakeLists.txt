@@ -40,6 +40,8 @@ endif()
 # --- Manager (Yingtao). Additive: no line above is changed. ---
 add_library(kvcache_manager src/config.cpp src/kv_cache_manager.cpp)
 target_link_libraries(kvcache_manager PUBLIC kvcache_storage)
+target_sources(kvcache PRIVATE src/trace.cpp)
+target_link_libraries(kvcache PRIVATE kvcache_manager)
 
 if(BUILD_TESTING)
   add_executable(manager_tests tests/manager_tests.cpp)
