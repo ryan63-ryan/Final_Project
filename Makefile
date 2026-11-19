@@ -30,3 +30,18 @@ sanitize:
 
 clean:
 	rm -rf build-make build-asan-make
+
+# --- Manager (Yingtao). Additive: no line above is changed. ---
+# Extra prerequisites on `all` and `test` hook these targets into the rules above,
+# so `make test` and `make sanitize` also build and run the manager tests.
+MANAGER = src/config.cpp src/kv_cache_manager.cpp
+
+.PHONY: manager-test
+all: $(BUILD)/manager_tests
+test: manager-test
+
+$(BUILD)/manager_tests: tests/manager_tests.cpp $(MANAGER) $(CORE) $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $(MANAGER) $< -o $@
+
+manager-test: $(BUILD)/manager_tests
+	./$(BUILD)/manager_tests

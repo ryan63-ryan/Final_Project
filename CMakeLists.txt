@@ -36,3 +36,13 @@ if(BUILD_TESTING)
     -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/block_demo.expected
     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_demo.cmake)
 endif()
+
+# --- Manager (Yingtao). Additive: no line above is changed. ---
+add_library(kvcache_manager src/config.cpp src/kv_cache_manager.cpp)
+target_link_libraries(kvcache_manager PUBLIC kvcache_storage)
+
+if(BUILD_TESTING)
+  add_executable(manager_tests tests/manager_tests.cpp)
+  target_link_libraries(manager_tests PRIVATE kvcache_manager)
+  add_test(NAME manager_tests COMMAND manager_tests)
+endif()
