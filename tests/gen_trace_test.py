@@ -123,6 +123,28 @@ def main():
             assert run.stdout.splitlines()[-1].startswith("STATS admitted=")
         print("PASS %s traces: valid, deterministic, replayed by the driver" % mode)
 
+    # Skewed modes: many system prompts, a few of them very popular.
+    for mode, longest in (("skewed", 256), ("skewed_short", 128 + 15)):
+        text = generate("--mode", mode, "--requests", 3000, "--seed", 3, "--vocab", 500)
+        assert text == generate("--mode", mode, "--requests", 3000, "--seed", 3, "--vocab", 500)
+        limits = {"prompt_min": 129, "prompt_max": longest, "max_active": 32, "vocab": 500}
+        prompts, outputs = replay(text, limits)
+        admitted = [tokens for tokens, forked in prompts if not forked]
+        uses = {}
+        for tokens in admitted:
+            uses[tuple(tokens[:128])] = uses.get(tuple(tokens[:128]), 0) + 1
+        ranked = sorted(uses.values(), reverse=True)
+        # Zipf with s = 1 over 1024 prompts: the top one gets about 13% of the
+        # requests, and several hundred different prompts appear at all.
+        assert 300 <= len(ranked) <= 1024, len(ranked)
+        assert 0.08 * len(admitted) <= ranked[0] <= 0.20 * len(admitted), ranked[:3]
+        assert ranked[0] > 5 * ranked[20], ranked[:21]
+        if mode == "skewed_short":
+            assert max(outputs) <= 8 and min(outputs) == 0
+        else:
+            assert max(outputs) == 64 and min(outputs) == 8
+        print("PASS %s traces: valid, deterministic, Zipf popularity" % mode)
+
     # Edge cases: no requests, one running request, and rejected arguments.
     assert generate("--mode", "unique", "--requests", 0).splitlines()[1:] == ["STATS"]
     replay(generate("--mode", "multiturn", "--requests", 50, "--max-active", 1, *flags[:8],

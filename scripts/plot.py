@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Plots the sweep written by scripts/run_experiments.sh.
 
-  python3 scripts/plot.py                         # results/raw/sweep.csv -> results/figures/
-  python3 scripts/plot.py --csv results/raw/x.csv --out results/figures --size 10k --capacity 1024
+  python3 scripts/plot.py                         # results/raw/sweep*.csv -> results/figures/
+  python3 scripts/plot.py --csv a.csv b.csv --out results/figures --size 10k --capacity 1024
 
-Figures (one PNG each, small multiples with one panel per workload):
+Rows from all given CSVs are pooled. Figures (one PNG each, small multiples with
+one panel per workload found in the data):
 
   hit_rate_vs_capacity.png         cached / prompt tokens of admitted requests
   uncached_tokens_vs_capacity.png  prompt tokens written fresh (recomputation proxy)
@@ -26,14 +27,16 @@ Needs matplotlib. The CSV is read with the standard library.
 
 import argparse
 import csv
+import glob
 import os
 import statistics
 import sys
 from collections import defaultdict
 
-MODES = ["unique", "system", "multiturn"]
+MODES = ["unique", "system", "multiturn", "skewed", "skewed_short"]
 MODE_TITLES = {"unique": "Unique prompts", "system": "Shared system prefix",
-               "multiturn": "Multi-turn conversations"}
+               "multiturn": "Multi-turn conversations", "skewed": "Zipf prefixes",
+               "skewed_short": "Zipf prefixes, short turns"}
 SIZES = ["1k", "10k", "100k"]
 OPS = ["admit", "append", "fork", "release"]
 
@@ -55,11 +58,13 @@ COUNTERS = ["admitted", "rejected", "errors", "skipped_ops", "prompt_tokens", "c
             "uncached_tokens", "cow_copies", "evictions", "peak_used_blocks"]
 
 
-def load(path):
+def load(paths):
     """Returns {(mode, size, capacity, series key): [row, ...]} with numeric fields."""
     groups = defaultdict(list)
-    with open(path, newline="") as source:
-        for row in csv.DictReader(source):
+    for path in paths:
+        with open(path, newline="") as source:
+            rows = list(csv.DictReader(source))
+        for row in rows:
             name = row["trace"]
             stem = name[:-len(".trace")] if name.endswith(".trace") else name
             mode, _, size = stem.rpartition("_")
@@ -72,7 +77,7 @@ def load(path):
             series = (sharing, row["policy"] if sharing == "on" else None)
             groups[(mode, size, int(row["capacity"]), series)].append(row)
     if not groups:
-        sys.exit("error: no rows in %s" % path)
+        sys.exit("error: no rows in %s" % ", ".join(paths))
     return groups
 
 
@@ -144,9 +149,12 @@ def finish(plt, figure, axes, title, note, path):
 def capacity_figure(plt, groups, capacities, size, compute, ylabel, title, note, path,
                     percent=False, zero_based=True):
     from matplotlib.ticker import FuncFormatter, PercentFormatter
-    figure, axes = plt.subplots(1, len(MODES), figsize=(11.5, 4.2), sharey=True)
+    modes = [m for m in MODES if any(key[0] == m and key[1] == size for key in groups)]
+    figure, axes = plt.subplots(1, len(modes), figsize=(3.85 * len(modes), 4.2), sharey=True,
+                                squeeze=False)
+    axes = list(axes[0])
     positions = list(range(len(capacities)))  # evenly spaced: the capacities are 4x apart
-    for axis, mode in zip(axes, MODES):
+    for axis, mode in zip(axes, modes):
         for series in SERIES:
             ys = [counter(groups, mode, size, capacity, series[0], compute)
                   for capacity in capacities]
@@ -164,18 +172,20 @@ def capacity_figure(plt, groups, capacities, size, compute, ylabel, title, note,
         else:
             axis.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "{:,.0f}".format(v)))
     axes[0].set_ylabel(ylabel)
-    figure.subplots_adjust(left=0.08, right=0.985, top=0.78, bottom=0.2, wspace=0.08)
+    figure.subplots_adjust(left=0.92 / (3.85 * len(modes)), right=0.985, top=0.78, bottom=0.2,
+                           wspace=0.08)
     finish(plt, figure, axes, title, note, path)
 
 
 def latency_figure(plt, groups, sizes, capacity, path):
     from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
-    figure, axes = plt.subplots(len(OPS), len(MODES), figsize=(11.5, 10.5), sharex=True,
-                                sharey="row")
+    modes = [m for m in MODES if any(key[0] == m and key[2] == capacity for key in groups)]
+    figure, axes = plt.subplots(len(OPS), len(modes), figsize=(3.85 * len(modes), 10.5),
+                                sharex=True, sharey="row", squeeze=False)
     positions = list(range(len(sizes)))
     for row, op in enumerate(OPS):
         drawn = []  # every value in this row, to choose a common y range
-        for column, mode in enumerate(MODES):
+        for column, mode in enumerate(modes):
             axis = axes[row][column]
             for series in SERIES:
                 middles, lows, highs = [], [], []
@@ -210,7 +220,8 @@ def latency_figure(plt, groups, sizes, capacity, path):
             middle = (low * high) ** 0.5
             span = max((high / low) ** 0.5 * 1.25, 2.0)
             axes[row][0].set_ylim(middle / span, middle * span)
-    figure.subplots_adjust(left=0.09, right=0.985, top=0.9, bottom=0.07, wspace=0.08,
+    figure.subplots_adjust(left=1.05 / (3.85 * len(modes)), right=0.985, top=0.9, bottom=0.07,
+                           wspace=0.08,
                            hspace=0.14)
     handles, labels = axes[0][0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="upper center", ncol=len(labels),
@@ -229,7 +240,8 @@ def latency_figure(plt, groups, sizes, capacity, path):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot a kvcache sweep.")
-    parser.add_argument("--csv", default="results/raw/sweep.csv")
+    parser.add_argument("--csv", nargs="+", default=None,
+                        help="one or more sweep CSVs (default: results/raw/sweep*.csv)")
     parser.add_argument("--out", default="results/figures")
     parser.add_argument("--size", default=None,
                         help="trace size for the capacity figures (default: largest in the CSV)")
@@ -244,7 +256,10 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    groups = load(args.csv)
+    paths = args.csv or sorted(glob.glob("results/raw/sweep*.csv"))
+    if not paths:
+        sys.exit("error: no results/raw/sweep*.csv; run scripts/run_experiments.sh or pass --csv")
+    groups = load(paths)
     check_deterministic(groups)
     sizes = [s for s in SIZES if any(key[1] == s for key in groups)]
     capacities = sorted({key[2] for key in groups})

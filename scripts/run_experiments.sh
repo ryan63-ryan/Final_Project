@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Runs the evaluation sweep of proposal section 6 and writes one CSV row per run.
 #
-#   scripts/run_experiments.sh                 full sweep (540 runs)
-#   scripts/run_experiments.sh --quick         1k traces, 1 repetition (36 runs)
+#   scripts/run_experiments.sh                 full sweep (900 runs)
+#   scripts/run_experiments.sh --quick         1k traces, 1 repetition (60 runs)
 #   scripts/run_experiments.sh --dry-run       print the plan and the time estimate only
 #   scripts/run_experiments.sh --sizes "1k 10k" --modes system --reps 3 --out results/raw/x.csv
 #
 # Sweep: sharing {off,on} x policy {lru,fifo} x capacity {256,1024,4096} x
-# mode {unique,system,multiturn} x size {1k,10k,100k}, 5 repetitions, with
+# mode {unique,system,multiturn,skewed,skewed_short} x size {1k,10k,100k}, 5
+# repetitions (the first three modes are the proposal's; see gen_trace.py), with
 # tokens_per_block=16 and bytes_per_token=64. Runs are sequential (they are
 # timed) and use the Release build (-O2) with --no-check.
 #
@@ -20,7 +21,7 @@ cd "$(dirname "$0")/.."
 SHARING="off on"
 POLICIES="lru fifo"
 CAPACITIES="256 1024 4096"
-MODES="unique system multiturn"
+MODES="unique system multiturn skewed skewed_short"
 SIZES="1k 10k 100k"
 REPS=5
 SEED=1                      # trace generator seed; the payload seed is fixed at 42
@@ -63,7 +64,7 @@ seconds_of() { case "$1" in 1k) echo 0.06 ;; 10k) echo 0.7 ;; 100k) echo 6.6 ;; 
 
 for value in $SHARING;    do case $value in on|off) ;; *) echo "bad sharing '$value'" >&2; exit 2 ;; esac; done
 for value in $POLICIES;   do case $value in lru|fifo) ;; *) echo "bad policy '$value'" >&2; exit 2 ;; esac; done
-for value in $MODES;      do case $value in unique|system|multiturn) ;; *) echo "bad mode '$value'" >&2; exit 2 ;; esac; done
+for value in $MODES;      do case $value in unique|system|multiturn|skewed|skewed_short) ;; *) echo "bad mode '$value'" >&2; exit 2 ;; esac; done
 for value in $CAPACITIES; do case $value in ''|*[!0-9]*) echo "bad capacity '$value'" >&2; exit 2 ;; esac; done
 case $REPS in ''|*[!0-9]*|0) echo "bad --reps '$REPS'" >&2; exit 2 ;; esac
 for size in $SIZES; do requests_of "$size" > /dev/null; done

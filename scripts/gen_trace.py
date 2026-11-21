@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 """Seeded trace generator for the kvcache driver (standard library only).
 
-Three workloads, matching proposal section 6:
+Five workloads. The first three match proposal section 6; the two skewed ones
+were added to study the eviction policies:
 
   unique     every prompt is random tokens: nothing to share except forks.
   system     every prompt starts with one of a few fixed system prompts,
              followed by a unique user part: a shared prefix across requests.
+  skewed     like system, but with many system prompts (by default 1024, more
+             prefix blocks than the largest pool holds) whose popularity
+             follows a Zipf law: a few are requested all the time, most rarely.
+             The cache cannot keep them all, so which ones it evicts matters.
+  skewed_short  skewed, with a user part shorter than one block (1-15 tokens)
+             and a short output (0-8 tokens by default): most requests reuse a
+             cached system prompt without filling a new block below it.
+
+             Why two skewed modes: only leaf blocks are evicted, and in "skewed"
+             (as in "system" and "multiturn") almost every cache hit also stores
+             new full blocks below the reused prefix. A prefix is then last used
+             just before its newest child is inserted, so "least recently used"
+             and "first inserted" order the candidates the same way and LRU and
+             FIFO evict the same blocks. In "skewed_short" a hit usually adds no
+             block, a popular prefix is reused while it is itself an eviction
+             candidate, and the two policies differ.
   multiturn  conversations: each turn is one request whose prompt is the whole
              conversation so far (previous prompt + previous output + a new
              user message), so each turn extends the previous turn's tokens.
@@ -26,10 +43,13 @@ Example:
 """
 
 import argparse
+import bisect
 import random
 import sys
 
-MODES = ("unique", "system", "multiturn")
+MODES = ("unique", "system", "multiturn", "skewed", "skewed_short")
+PREFIX_MODES = ("system", "skewed", "skewed_short")
+ZIPF_MODES = ("skewed", "skewed_short")
 
 
 def parse_args(argv):
@@ -45,15 +65,24 @@ def parse_args(argv):
                    help="chance per step that a new request starts while below --max-active")
     p.add_argument("--prompt-min", type=int, default=32, help="shortest prompt in tokens")
     p.add_argument("--prompt-max", type=int, default=256, help="longest prompt in tokens")
-    p.add_argument("--output-min", type=int, default=8, help="fewest APPENDs per request")
-    p.add_argument("--output-max", type=int, default=64, help="most APPENDs per request")
+    p.add_argument("--output-min", type=int, default=None,
+                   help="fewest APPENDs per request (default 8; 0 for skewed_short)")
+    p.add_argument("--output-max", type=int, default=None,
+                   help="most APPENDs per request (default 64; 8 for skewed_short)")
     p.add_argument("--vocab", type=int, default=32000, help="tokens are 0 .. vocab-1")
     p.add_argument("--fork-fraction", type=float, default=0.02,
                    help="fraction of requests created by FORK instead of ADMIT")
-    p.add_argument("--system-prompts", type=int, default=4,
-                   help="system mode: number of distinct system prompts")
+    p.add_argument("--system-prompts", type=int, default=None,
+                   help="system and skewed modes: number of distinct system prompts "
+                        "(default 4 for system, 1024 for skewed and skewed_short)")
     p.add_argument("--system-len", type=int, default=128,
-                   help="system mode: tokens in each system prompt")
+                   help="system and skewed modes: tokens in each system prompt")
+    p.add_argument("--zipf", type=float, default=1.0,
+                   help="skewed modes: Zipf exponent s; the k-th most popular system prompt "
+                        "is chosen with weight 1 / k^s")
+    p.add_argument("--short-user-max", type=int, default=15,
+                   help="skewed_short mode: longest user part in tokens; keep it below the "
+                        "block size so the user part alone never fills a block")
     p.add_argument("--turn-min", type=int, default=16,
                    help="multiturn mode: fewest new user tokens per turn")
     p.add_argument("--turn-max", type=int, default=64,
@@ -67,6 +96,11 @@ def parse_args(argv):
         if not ok:
             p.error(message)
 
+    short = args.mode == "skewed_short"
+    if args.output_min is None:
+        args.output_min = 0 if short else 8
+    if args.output_max is None:
+        args.output_max = 8 if short else 64
     need(args.requests >= 0, "--requests must not be negative")
     need(args.max_active >= 1, "--max-active must be at least 1")
     need(0.0 < args.arrival <= 1.0, "--arrival must be in (0, 1]")
@@ -75,10 +109,19 @@ def parse_args(argv):
     need(1 <= args.vocab <= 2 ** 31, "--vocab must be in 1 .. 2^31")
     need(0.0 <= args.fork_fraction < 1.0, "--fork-fraction must be in [0, 1)")
     need(0.0 <= args.continue_chance <= 1.0, "--continue-chance must be in [0, 1]")
-    if args.mode == "system":
+    if args.system_prompts is None:
+        args.system_prompts = 1024 if args.mode in ZIPF_MODES else 4
+    need(args.zipf >= 0.0, "--zipf must not be negative")
+    if args.mode in PREFIX_MODES:
         need(args.system_prompts >= 1, "--system-prompts must be at least 1")
         need(1 <= args.system_len < args.prompt_max,
              "need 1 <= --system-len < --prompt-max (room for a user part)")
+    if short:
+        need(args.short_user_max >= 1, "--short-user-max must be at least 1")
+        need(args.prompt_min <= args.system_len + 1 and
+             args.system_len + args.short_user_max <= args.prompt_max,
+             "skewed_short prompts (--system-len + 1 .. --short-user-max) must lie in "
+             "--prompt-min .. --prompt-max")
     if args.mode == "multiturn":
         need(1 <= args.turn_min <= args.turn_max, "need 1 <= --turn-min <= --turn-max")
         need(args.turn_min <= args.prompt_max, "--turn-min must fit in --prompt-max")
@@ -96,8 +139,14 @@ class Generator:
         self.active_ids = []  # same keys, for O(1) random choice
         self.waiting = []     # multiturn: token histories of conversations between turns
         self.system = []
-        if args.mode == "system":
+        self.popularity = None  # skewed: cumulative Zipf weights over self.system
+        if args.mode in PREFIX_MODES:
             self.system = [self.tokens(args.system_len) for _ in range(args.system_prompts)]
+        if args.mode in ZIPF_MODES:
+            total, self.popularity = 0.0, []
+            for rank in range(1, args.system_prompts + 1):
+                total += 1.0 / rank ** args.zipf
+                self.popularity.append(total)
 
     def tokens(self, count):
         vocab = self.args.vocab
@@ -108,10 +157,16 @@ class Generator:
         a, rng = self.args, self.rng
         if a.mode == "unique":
             return self.tokens(rng.randint(a.prompt_min, a.prompt_max)), False
-        if a.mode == "system":
-            user_min = max(1, a.prompt_min - a.system_len)
-            user = self.tokens(rng.randint(user_min, a.prompt_max - a.system_len))
-            return rng.choice(self.system) + user, False
+        if a.mode in PREFIX_MODES:
+            if a.mode == "skewed_short":
+                user = self.tokens(rng.randint(1, a.short_user_max))
+            else:
+                user_min = max(1, a.prompt_min - a.system_len)
+                user = self.tokens(rng.randint(user_min, a.prompt_max - a.system_len))
+            if a.mode == "system":
+                return rng.choice(self.system) + user, False
+            index = bisect.bisect_left(self.popularity, rng.random() * self.popularity[-1])
+            return self.system[min(index, len(self.system) - 1)] + user, False
         # multiturn: continue a waiting conversation if it still fits, else start one.
         message = self.tokens(rng.randint(a.turn_min, min(a.turn_max, a.prompt_max)))
         if self.waiting and rng.random() < a.continue_chance:
