@@ -1,78 +1,86 @@
 #pragma once
 
-// ============================================================================
-// PROPOSAL - Bowen to review.
-//
-// Written by Yingtao as the interface the KVCacheManager would like to call.
-// Declarations and comments only: there is no implementation, nothing includes
-// this header yet, and every name and signature here is open to change.
-// Private members are left out on purpose; they are Bowen's design.
-//
-// Open questions for Bowen:
-//   1. Is one tree node per full block acceptable to you, or do you want
-//      compressed edges covering several blocks? The interface below only
-//      talks about blocks, so either should fit.
-//   2. If two requests fill a block with the same prefix independently, the
-//      second insert() returns false and that block stays private. OK?
-//   3. Should match() take the token vector (as below) or the manager's
-//      per-block prefix hashes?
-// ============================================================================
-
 #include "kvcache/block_pool.h"
-#include "kvcache/types.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace kvcache {
 
+// Same definition as the manager's types.h; move it there once both are merged.
+using Token = std::int32_t;
+
 // Prefix index over FULL blocks. A path from the root spells a token prefix in
 // steps of tokens_per_block tokens; each node names the block that stores the
-// last step of that prefix.
+// last step of that prefix. One node per block: edges are not compressed.
 //
-// Ownership (from the storage README): the index holds exactly one pool
-// reference for every block it contains. insert() retains, erase() releases.
-// So for an indexed block, references(id) == 1 means "cached, no request uses it".
-// The pool must outlive the tree.
+// The index owns exactly one pool reference per indexed block: insert() retains,
+// erase() and destruction release. For an indexed block, references(id) == 1
+// means "cached, no request uses it". The pool must outlive the tree.
 class RadixTree {
 public:
     explicit RadixTree(BlockPool& pool);
     ~RadixTree(); // releases every reference the index still holds
     RadixTree(const RadixTree&) = delete;
     RadixTree& operator=(const RadixTree&) = delete;
+    // A moved-from tree may only be destroyed or assigned to.
+    RadixTree(RadixTree&& other) noexcept;
+    RadixTree& operator=(RadixTree&& other) noexcept;
 
-    // Longest cached run of full blocks at the start of `tokens`.
-    // Returns the block IDs in order; k IDs means the first
-    // k * tokens_per_block tokens are cached. Changes no reference count:
-    // the manager pins the result with BlockTable::from_prefix.
-    // Used by: ADMIT.
+    // Longest cached run of full blocks at the start of `tokens`. k IDs means the
+    // first k * tokens_per_block tokens are cached; a trailing partial block never
+    // matches. Changes no reference count: pin the result with
+    // BlockTable::from_prefix before anything can be erased.
     std::vector<BlockId> match(const std::vector<Token>& tokens) const;
 
     // Records that `block` stores the last tokens_per_block tokens of `prefix`.
-    // Requires: prefix.size() is a positive multiple of tokens_per_block, the
-    // block is full, and the prefix one block shorter is already indexed (or
-    // is empty). On success retains `block` and returns true. Returns false and
-    // changes nothing if this prefix is already indexed.
-    // Used by: ADMIT and APPEND, each time a request fills a block.
+    // Returns false and changes nothing if this prefix is already indexed.
+    // On success retains `block` and returns true.
+    // Throws std::invalid_argument if prefix.size() is not a positive multiple of
+    // tokens_per_block, the block is not full, the block is already indexed, or
+    // the prefix one block shorter is not indexed; std::out_of_range if the
+    // block is not allocated. A throw changes nothing.
     bool insert(const std::vector<Token>& prefix, BlockId block);
 
-    // Removes a leaf block from the index and releases its reference.
-    // Returns false and changes nothing if the block is not indexed or still
-    // has children (evicting it would orphan longer cached prefixes).
-    // Used by: eviction.
+    // Removes a leaf block and releases its reference. Returns false and changes
+    // nothing if the block is not indexed or still has children.
     bool erase(BlockId block);
 
     bool contains(BlockId block) const;
     bool is_leaf(BlockId block) const; // false if not indexed
-    // Parent block in the tree; nullopt for a first-level block or if not
-    // indexed. After a leaf is evicted its parent may become a leaf.
+    // Indexed leaf whose only reference is the index's own: no request uses it
+    // and removing it orphans nothing.
+    bool is_evictable(BlockId block) const;
+    // Parent block; nullopt for a first-level block or if not indexed.
     std::optional<BlockId> parent(BlockId block) const;
-    std::size_t size() const noexcept; // number of indexed blocks
+    std::size_t size() const noexcept { return index_.size(); }
 
-    // True if every node's block is allocated and full, every child prefix
-    // extends its parent's, and no block appears twice.
+    // Every node's block is allocated, full and referenced; keys have
+    // tokens_per_block tokens; parent links and the block index agree with the
+    // tree; no block appears twice.
     bool check_invariants() const;
+
+private:
+    struct Node;
+    using Children = std::map<std::vector<Token>, std::unique_ptr<Node>>;
+    struct Node {
+        Node* parent = nullptr; // nullptr for the root
+        BlockId block = 0;      // unused for the root
+        Children children;
+        Children::iterator self; // this node's entry in parent->children
+    };
+
+    void release_all() noexcept;
+    bool check_node(const Node& node, std::size_t& count) const;
+
+    BlockPool* pool_;
+    std::unique_ptr<Node> root_;
+    std::unordered_map<BlockId, Node*> index_;
 };
 
 } // namespace kvcache
