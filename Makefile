@@ -70,3 +70,9 @@ trace-test: $(BUILD)/kvcache
 	  ./$(BUILD)/kvcache --config tests/golden/eviction_$$c.cfg --trace tests/golden/eviction.trace > $(BUILD)/eviction_$$c.actual && \
 	  diff -u tests/golden/eviction_$$c.expected $(BUILD)/eviction_$$c.actual || exit 1; \
 	done
+
+# --csv appends one row per run; needs CMake only as a script interpreter.
+.PHONY: csv-test
+csv-test: $(BUILD)/kvcache
+	cmake -DPROGRAM=$(BUILD)/kvcache -DCONFIG=tests/golden/eviction_lru.cfg \
+	  -DTRACE=tests/golden/eviction.trace -DCSV=$(BUILD)/csv_test.csv -P tests/check_csv.cmake

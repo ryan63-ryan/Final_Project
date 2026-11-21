@@ -68,4 +68,10 @@ if(BUILD_TESTING)
       -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_${variant}.expected
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_trace.cmake)
   endforeach()
+  add_test(NAME driver_csv COMMAND ${CMAKE_COMMAND}
+    -DPROGRAM=$<TARGET_FILE:kvcache>
+    -DCONFIG=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_lru.cfg
+    -DTRACE=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction.trace
+    -DCSV=${CMAKE_CURRENT_BINARY_DIR}/driver_csv_test.csv
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_csv.cmake)
 endif()
