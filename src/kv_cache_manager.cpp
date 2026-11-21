@@ -20,6 +20,11 @@ std::uint64_t mix(std::uint64_t x) {
     return x;
 }
 
+std::unique_ptr<EvictionPolicy> make_policy(PolicyKind kind) {
+    if (kind == PolicyKind::FIFO) return std::make_unique<FIFOPolicy>();
+    return std::make_unique<LRUPolicy>();
+}
+
 } // namespace
 
 std::uint64_t initial_prefix_hash(std::uint64_t seed) { return mix(seed); }
@@ -40,14 +45,19 @@ Payload make_payload(std::uint64_t prefix_hash, std::size_t bytes_per_token) {
 KVCacheManager::KVCacheManager(const Config& config)
     : config_(config),
       pool_(std::make_unique<BlockPool>(config.capacity, config.tokens_per_block,
-                                        config.bytes_per_token)) {}
+                                        config.bytes_per_token)),
+      tree_(*pool_),
+      policy_(make_policy(config.policy)) {}
 
 KVCacheManager::~KVCacheManager() = default;
 KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept = default;
 
 KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept {
     if (this != &other) {
-        requests_.clear(); // our tables must release before our pool is destroyed
+        // Our tables and our index must release before our pool is destroyed.
+        requests_.clear();
+        tree_ = std::move(other.tree_); // releases our index's references first
+        policy_ = std::move(other.policy_);
         config_ = other.config_;
         pool_ = std::move(other.pool_);
         requests_ = std::move(other.requests_);
@@ -200,6 +210,10 @@ Payload KVCacheManager::read_request(const RequestId& id) const {
     return bytes;
 }
 
+std::size_t KVCacheManager::block_references(BlockId block) const {
+    return pool_->allocated(block) ? pool_->references(block) : 0;
+}
+
 Stats KVCacheManager::stats() const {
     Stats stats = stats_;
     stats.used_blocks = pool_->capacity() - pool_->free_count();
@@ -224,15 +238,24 @@ bool KVCacheManager::check_invariants() const {
         if (hash != state.prefix_hash) return false;
         for (BlockId block : state.table.blocks()) ++holders[block];
     }
-    // Every reference must belong to a request: no leaked and no missing counts.
-    // TODO(integration): an indexed block has one extra reference, held by the index.
+    // Every reference must belong to a request or to the index (one per indexed
+    // block): no leaked and no missing counts.
+    if (!tree_.check_invariants() || !policy_->check_invariants()) return false;
+    std::size_t evictable = 0;
     for (BlockId id = 0; id < pool_->capacity(); ++id) {
-        auto references = pool_->allocated(id) ? pool_->references(id) : 0;
-        if (references != holders[id]) return false;
+        if (block_references(id) != holders[id] + (tree_.contains(id) ? 1 : 0)) return false;
+        if (tree_.is_evictable(id)) ++evictable;
     }
-    if (!config_.sharing)
+    // The policy's evictable set must be exactly the tree's evictable leaves. The
+    // policy has no per-block query, so compare the sizes and the next victim.
+    if (policy_->evictable_count() != evictable) return false;
+    auto victim = policy_->victim();
+    if (victim && !tree_.is_evictable(*victim)) return false;
+    if (!config_.sharing) {
+        if (tree_.size() != 0) return false; // the baseline never uses the index
         for (std::size_t count : holders)
             if (count > 1) return false;
+    }
     return true;
 }
 

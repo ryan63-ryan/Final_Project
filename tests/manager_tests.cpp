@@ -158,6 +158,24 @@ void failure_tests() {
     target = std::move(moved);
     CHECK(!target.has_request("old") && target.read_request("fill") == fill);
     CHECK(target.check_invariants());
+    // Blocks 0-1 hold r1, 2-3 hold fill; nothing is free or over-counted.
+    CHECK(target.block_references(0) == 1 && target.block_references(3) == 1);
+    CHECK(target.release("fill").status == Status::Ok && target.block_references(3) == 0);
+}
+
+// Both policies and both sharing modes construct, and an empty prefix cache
+// satisfies the manager's index and policy invariants.
+void wiring_tests() {
+    for (PolicyKind kind : {PolicyKind::LRU, PolicyKind::FIFO})
+        for (bool sharing : {true, false}) {
+            Config config = small_config(sharing);
+            config.policy = kind;
+            KVCacheManager manager(config);
+            CHECK(manager.indexed_blocks() == 0 && manager.evictable_blocks() == 0);
+            CHECK(manager.admit("r", {1}).status == Status::Ok);
+            CHECK(!manager.is_indexed(0) && manager.block_references(0) == 1);
+            CHECK(manager.block_references(1) == 0 && manager.check_invariants());
+        }
 }
 
 int main() {
@@ -166,6 +184,7 @@ int main() {
         cow_tests(); std::cout << "PASS proposal example, fork and copy-on-write\n";
         baseline_tests(); std::cout << "PASS sharing=off baseline\n";
         failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact\n";
+        wiring_tests(); std::cout << "PASS index and policy wiring\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

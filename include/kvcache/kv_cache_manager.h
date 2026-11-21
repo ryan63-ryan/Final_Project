@@ -2,6 +2,8 @@
 
 #include "kvcache/block_table.h"
 #include "kvcache/config.h"
+#include "kvcache/eviction_policy.h"
+#include "kvcache/radix_tree.h"
 #include "kvcache/types.h"
 
 #include <cstddef>
@@ -74,6 +76,12 @@ public:
     Payload read_request(const RequestId& id) const;
 
     Stats stats() const; // O(capacity): scans the pool for fragmentation
+    // Prefix-cache state, for tests and the demo.
+    std::size_t indexed_blocks() const noexcept { return tree_.size(); }
+    std::size_t evictable_blocks() const { return policy_->evictable_count(); }
+    bool is_indexed(BlockId block) const { return tree_.contains(block); }
+    // Pool references of a block (requests + 1 if indexed); 0 if it is free.
+    std::size_t block_references(BlockId block) const;
     const Config& config() const noexcept { return config_; }
     bool check_invariants() const;
 
@@ -91,9 +99,12 @@ private:
     void note_usage();
 
     Config config_;
-    // The pool is declared before requests_ so the tables are destroyed first.
-    // unique_ptr keeps its address stable when the manager is moved.
+    // The pool is declared before tree_ and requests_ so the index and the
+    // tables release their references first. unique_ptr keeps its address
+    // stable when the manager is moved.
     std::unique_ptr<BlockPool> pool_;
+    RadixTree tree_;                         // prefix index; stays empty when sharing=off
+    std::unique_ptr<EvictionPolicy> policy_; // ranks the blocks in tree_
     std::unordered_map<RequestId, RequestState> requests_;
     Stats stats_;
 };
