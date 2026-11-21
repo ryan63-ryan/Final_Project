@@ -70,9 +70,16 @@ trace-test: $(BUILD)/kvcache
 	  ./$(BUILD)/kvcache --config tests/golden/eviction_$$c.cfg --trace tests/golden/eviction.trace > $(BUILD)/eviction_$$c.actual && \
 	  diff -u tests/golden/eviction_$$c.expected $(BUILD)/eviction_$$c.actual || exit 1; \
 	done
+	./$(BUILD)/kvcache --config tests/golden/example.cfg --trace tests/golden/fork_rejected.trace > $(BUILD)/fork_rejected.actual
+	diff -u tests/golden/fork_rejected.expected $(BUILD)/fork_rejected.actual
 
 # --csv appends one row per run; needs CMake only as a script interpreter.
 .PHONY: csv-test
 csv-test: $(BUILD)/kvcache
 	cmake -DPROGRAM=$(BUILD)/kvcache -DCONFIG=tests/golden/eviction_lru.cfg \
 	  -DTRACE=tests/golden/eviction.trace -DCSV=$(BUILD)/csv_test.csv -P tests/check_csv.cmake
+
+# Trace generator: valid, deterministic traces that the driver replays without errors.
+.PHONY: gen-test
+gen-test: $(BUILD)/kvcache
+	python3 tests/gen_trace_test.py $(BUILD)/kvcache

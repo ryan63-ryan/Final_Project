@@ -68,6 +68,17 @@ if(BUILD_TESTING)
       -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_${variant}.expected
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_trace.cmake)
   endforeach()
+  add_test(NAME fork_rejected_golden COMMAND ${CMAKE_COMMAND}
+    -DPROGRAM=$<TARGET_FILE:kvcache>
+    -DCONFIG=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/example.cfg
+    -DTRACE=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fork_rejected.trace
+    -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fork_rejected.expected
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_trace.cmake)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    add_test(NAME gen_trace COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/gen_trace_test.py $<TARGET_FILE:kvcache>)
+  endif()
   add_test(NAME driver_csv COMMAND ${CMAKE_COMMAND}
     -DPROGRAM=$<TARGET_FILE:kvcache>
     -DCONFIG=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_lru.cfg
