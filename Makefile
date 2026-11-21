@@ -2,16 +2,19 @@ CXX = c++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Wpedantic
 CPPFLAGS = -Iinclude
 BUILD = build-make
-CORE = src/block_pool.cpp src/block_table.cpp
+CORE = src/block_pool.cpp src/block_table.cpp src/radix_tree.cpp
 HEADERS = $(wildcard include/kvcache/*.h)
 
 .PHONY: all test sanitize clean
-all: $(BUILD)/storage_tests $(BUILD)/block_demo $(BUILD)/kvcache
+all: $(BUILD)/storage_tests $(BUILD)/radix_tests $(BUILD)/block_demo $(BUILD)/kvcache
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/storage_tests: tests/storage_tests.cpp $(CORE) $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
+
+$(BUILD)/radix_tests: tests/radix_tests.cpp $(CORE) $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
 
 $(BUILD)/block_demo: examples/block_demo.cpp $(CORE) $(HEADERS) | $(BUILD)
@@ -22,6 +25,7 @@ $(BUILD)/kvcache: src/main.cpp $(CORE) $(HEADERS) | $(BUILD)
 
 test: all
 	./$(BUILD)/storage_tests
+	./$(BUILD)/radix_tests
 	./$(BUILD)/block_demo tests/golden/block_demo.in > $(BUILD)/demo.actual
 	diff -u tests/golden/block_demo.expected $(BUILD)/demo.actual
 
