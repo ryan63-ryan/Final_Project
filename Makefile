@@ -65,3 +65,8 @@ test: trace-test
 trace-test: $(BUILD)/kvcache
 	./$(BUILD)/kvcache --config tests/golden/example.cfg --trace tests/golden/example.trace > $(BUILD)/example.actual
 	diff -u tests/golden/example.expected $(BUILD)/example.actual
+# Eviction demo trace under LRU, FIFO and the sharing=off baseline.
+	for c in lru fifo off; do \
+	  ./$(BUILD)/kvcache --config tests/golden/eviction_$$c.cfg --trace tests/golden/eviction.trace > $(BUILD)/eviction_$$c.actual && \
+	  diff -u tests/golden/eviction_$$c.expected $(BUILD)/eviction_$$c.actual || exit 1; \
+	done

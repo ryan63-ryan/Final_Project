@@ -1,0 +1,19 @@
+# LRU vs FIFO eviction demo (block_tokens=2, capacity_blocks=4).
+# The step-by-step calculation is in tests/manager_tests.cpp, eviction_trace_tests.
+ADMIT a 1 2
+ADMIT b 3 4
+ADMIT c 5 6
+RELEASE a
+RELEASE b
+RELEASE c
+# d reuses a's cached block: LRU refreshes it, FIFO does not.
+ADMIT d 1 2
+RELEASE d
+# Needs 2 blocks with 1 free: LRU evicts [3,4], FIFO evicts [1,2].
+ADMIT e 7 8 9 10
+# Hit under LRU, miss (and another eviction) under FIFO.
+ADMIT f 1 2
+RELEASE e
+# Needs 3 blocks with 2 evictable leaves: the third comes from the cascade.
+ADMIT g 20 21 22 23 24
+STATS

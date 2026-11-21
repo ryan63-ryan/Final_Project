@@ -60,4 +60,12 @@ if(BUILD_TESTING)
     -DTRACE=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/example.trace
     -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/example.expected
     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_trace.cmake)
+  foreach(variant lru fifo off)
+    add_test(NAME eviction_trace_${variant}_golden COMMAND ${CMAKE_COMMAND}
+      -DPROGRAM=$<TARGET_FILE:kvcache>
+      -DCONFIG=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_${variant}.cfg
+      -DTRACE=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction.trace
+      -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/eviction_${variant}.expected
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_trace.cmake)
+  endforeach()
 endif()

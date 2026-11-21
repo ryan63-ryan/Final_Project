@@ -137,6 +137,44 @@ void baseline_tests() {
     CHECK(manager.stats().peak_used_blocks == 4 && manager.check_invariants());
 }
 
+// sharing=off bypasses the prefix index completely: equal prompts are stored
+// twice, nothing is cached after RELEASE and nothing can be evicted.
+void baseline_bypass_tests() {
+    using Blocks = std::vector<BlockId>;
+    for (PolicyKind kind : {PolicyKind::LRU, PolicyKind::FIFO}) {
+        Config config = small_config(false);
+        config.policy = kind; // irrelevant when sharing=off
+        KVCacheManager manager(config);
+        OpResult result = manager.admit("a", {1, 2, 3, 4});
+        CHECK(result.blocks == Blocks({0, 1}) && result.cached_tokens == 0);
+        result = manager.admit("b", {1, 2, 3, 4});
+        CHECK(result.blocks == Blocks({2, 3}) && result.cached_tokens == 0);
+        CHECK(manager.indexed_blocks() == 0 && manager.evictable_blocks() == 0);
+        for (BlockId block = 0; block < 4; ++block) CHECK(manager.block_references(block) == 1);
+        // With sharing=on this prompt would be a full cache hit needing no block.
+        result = manager.admit("c", {1, 2});
+        CHECK(result.status == Status::Reject);
+        CHECK(result.message == "needs 1 block, 0 free, 0 evictable");
+        CHECK(manager.append("a", 5).status == Status::Reject);
+
+        // RELEASE frees full blocks at once; there is no cache to hit afterwards.
+        CHECK(manager.release("a").freed == Blocks({0, 1}));
+        CHECK(manager.indexed_blocks() == 0 && manager.stats().used_blocks == 2);
+        result = manager.admit("c", {1, 2});
+        CHECK(result.status == Status::Ok && result.cached_tokens == 0);
+        CHECK(result.evicted.empty() && manager.block_references(result.blocks.at(0)) == 1);
+        // Filling a block by APPEND does not index it either.
+        CHECK(manager.append("c", 3).status == Status::Ok);
+        CHECK(manager.append("c", 4).status == Status::Ok && manager.indexed_blocks() == 0);
+        // The stored bytes are the same as with sharing.
+        CHECK(manager.read_request("b") == expected_bytes({1, 2, 3, 4}));
+        CHECK(manager.read_request("c") == manager.read_request("b"));
+        Stats stats = manager.stats();
+        CHECK(stats.cached_tokens == 0 && stats.uncached_tokens == 10 && stats.evictions == 0);
+        CHECK(stats.cow_copies == 0 && stats.rejected == 2 && manager.check_invariants());
+    }
+}
+
 // Error and Reject must leave the manager exactly as it was.
 void failure_tests() {
     KVCacheManager manager(small_config(true));
@@ -599,6 +637,7 @@ int main() {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
         cow_tests(); std::cout << "PASS proposal example, fork and copy-on-write\n";
         baseline_tests(); std::cout << "PASS sharing=off baseline\n";
+        baseline_bypass_tests(); std::cout << "PASS sharing=off bypasses the prefix index\n";
         failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact\n";
         wiring_tests(); std::cout << "PASS index and policy wiring\n";
         indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
