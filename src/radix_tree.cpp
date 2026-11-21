@@ -102,6 +102,10 @@ bool RadixTree::is_leaf(BlockId block) const {
     return it != index_.end() && it->second->children.empty();
 }
 
+bool RadixTree::is_evictable(BlockId block) const {
+    return is_leaf(block) && pool_->references(block) == 1;
+}
+
 std::optional<BlockId> RadixTree::parent(BlockId block) const {
     auto it = index_.find(block);
     if (it == index_.end() || it->second->parent == root_.get()) return std::nullopt;

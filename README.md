@@ -12,9 +12,9 @@ See the [proposal](EE538_Final_Project_Proposal.pdf) for the agreed scope.
 | Bowen Deng | Radix prefix index, LRU/FIFO eviction |
 | Yingtao Yang | Manager, CLI, reference model, workloads and experiment integration |
 
-The storage library, radix prefix index and `block_demo` run independently. The
-`kvcache` entry point is still a placeholder; the complete manager, eviction policies
-and experiments require team integration.
+The storage library, radix prefix index, LRU/FIFO eviction policies and `block_demo`
+run independently. The `kvcache` entry point is still a placeholder; the complete
+manager and experiments require team integration.
 
 ## Build and test
 
@@ -46,7 +46,8 @@ to enable AddressSanitizer and UndefinedBehaviorSanitizer.
 | `BlockPool` | Owns preallocated bytes; `allocate`, `clone`, `retain`, `release`, `read_token`. Exhaustion returns `nullopt`. |
 | `BlockTable` | Maps a request to blocks; `append`, `fork`, `from_prefix`, `read_token`, `clear`. Capacity failure on one append returns false without changing stored state. |
 | `MinHeap<T, Compare>` | Custom indexed heap; `push`, `top`, `pop`, `update`, `erase`. Lower priority wins, then lower key. |
-| `RadixTree` | Prefix index over full blocks, one node per block; `match`, `insert`, `erase`, `contains`, `is_leaf`, `parent`. Holds one pool reference per indexed block. |
+| `RadixTree` | Prefix index over full blocks, one node per block; `match`, `insert`, `erase`, `contains`, `is_leaf`, `is_evictable`, `parent`. Holds one pool reference per indexed block. |
+| `LRUPolicy`, `FIFOPolicy` | `EvictionPolicy` implementations on `MinHeap`; `on_insert`, `on_access`, `on_erase`, `set_evictable`, `victim`. `evict_one(tree, policy)` performs one eviction. |
 
 Construct the pool before tables/indexes and destroy it last. Each table entry
 owns one reference; `clear` and destruction release it. IDs returned by `blocks()`
@@ -74,14 +75,26 @@ changes); it retains the block, or returns false if the prefix is already indexe
 in which case the caller's block stays private. `erase` releases only leaves, so
 evicting a leaf can turn its parent into a leaf. Destroying the tree releases all of
 its references. The heap comparator must not throw and priorities must support
-non-throwing moves. LRU/FIFO policies decide heap eligibility and update its ranks.
+non-throwing moves.
+
+Each policy gives every tracked block a unique rank from a monotonic clock and keeps
+only evictable blocks in its heap; the smallest rank is the victim. Both rank a block
+by insertion; only LRU re-ranks it on `on_access`. Tracked blocks start not evictable.
+The caller reports eligibility with `set_evictable(id, tree.is_evictable(id))`, where
+`is_evictable` means an indexed leaf whose only reference is the index's own, i.e. no
+request holds it. `evict_one` erases the victim from the tree and the policy, then
+re-checks the parent, which may have just become a leaf. It throws `logic_error`
+without changes if the victim is not `is_evictable`, so a stale mark cannot evict a
+held block or an inner node. `make_policy`/`PolicyKind` selection is left to the
+manager integration.
 
 ## Validation and complexity
 
 Tests check pool accounting, payload isolation, ownership, capacity failure, moves,
-cached prefixes, heap invariants and the radix index. They include 27,000 seeded storage
-steps against independent payload vectors, 30,000 heap steps against a scan-based
-reference, 30,000 radix steps against a map of indexed prefixes,
+cached prefixes, heap invariants, the radix index and eviction. They include 27,000
+seeded storage steps against independent payload vectors, 30,000 heap steps against a
+scan-based reference, 30,000 radix steps against a map of indexed prefixes, 36,000
+LRU/FIFO steps (with request pins) against a scan of eligible blocks and their ranks,
 16-token/64-byte storage, and a 4,097-entry heap with 64-bit priorities. Seeds are
 538, 2026 and 17; random steps include no-op choices. Golden demo output and 12 extra
 input/error cases are included. The demo reads a prompt length (0–7), its byte values,
@@ -90,9 +103,11 @@ then one append byte; it uses four blocks of two tokens and prints both request 
 Validated on macOS 14.3/arm64 with Apple Clang 15.0.0 and Make 3.81. Release uses
 `-std=c++17 -O2 -Wall -Wextra -Wpedantic`; a fresh build also passed `-Werror`.
 ASan/UBSan builds use `-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer`
-and passed without reported errors. The radix index was added and checked on
-Ubuntu 22.04 (WSL2) with GCC 11.4.0 and CMake 3.22.1: `make test` with `-Werror`, `make sanitize`, the 12 demo
-cases, and CMake Release and sanitizer `ctest` all passed. These checks cover storage, not the full manager or a process-wide leak audit.
+and passed without reported errors. The radix index and eviction policies were added
+and checked on Ubuntu 22.04 (WSL2) with GCC 11.4.0 and CMake 3.22.1: `make test` with
+`-Werror`, `make sanitize`, the 12 demo cases, and CMake Release and sanitizer `ctest`
+all passed. These checks cover storage, the index and the policies, not the full
+manager or a process-wide leak audit.
 
 Let C be pool capacity, B tokens/block, P bytes/token, L blocks/request and H heap
 entries. Pool construction costs O(CBP) time/space. Allocate zeroes a block and clone
@@ -101,7 +116,9 @@ Table growth can copy O(L) IDs, amortized O(1) per added ID. Fork/import/clear a
 A radix match or insert over k blocks costs O(kB log F) token comparisons, where F is
 the largest number of children of one node; contains/is_leaf/parent/erase use an
 expected O(1) block lookup (plus O(1) amortized map erase). The index uses O(NB)
-token space for N indexed blocks. The heap uses O(H) space and O(log H) repair comparisons, with expected O(1) hash
+token space for N indexed blocks. With T tracked and E evictable blocks, a policy uses
+O(T) space; insert/access/erase/set_evictable cost O(log E) heap work plus expected O(1)
+hash lookups, and victim is O(1). `evict_one` adds a radix erase. The heap uses O(H) space and O(log H) repair comparisons, with expected O(1) hash
 lookups; growth/rehashing is amortized and adversarial collisions worsen the bounds.
 Pool payload capacity excludes metadata and allocator overhead. No model-serving
 speedup or full-project performance result is claimed.

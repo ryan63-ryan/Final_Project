@@ -53,6 +53,9 @@ public:
 
     bool contains(BlockId block) const;
     bool is_leaf(BlockId block) const; // false if not indexed
+    // Indexed leaf whose only reference is the index's own: no request uses it
+    // and removing it orphans nothing.
+    bool is_evictable(BlockId block) const;
     // Parent block; nullopt for a first-level block or if not indexed.
     std::optional<BlockId> parent(BlockId block) const;
     std::size_t size() const noexcept { return index_.size(); }
