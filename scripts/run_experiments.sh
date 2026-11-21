@@ -57,8 +57,9 @@ requests_of() {
     *) echo "unknown size '$1' (use 1k, 10k or 100k)" >&2; exit 2 ;;
   esac
 }
-# Seconds for one run, measured on the development laptop (WSL2, -O2).
-seconds_of() { case "$1" in 1k) echo 0.06 ;; 10k) echo 0.5 ;; 100k) echo 4.5 ;; esac; }
+# Seconds for one run, from the full sweep on the development machine (WSL2,
+# -O2, traces read from a Windows drive): 540 runs took 22 minutes.
+seconds_of() { case "$1" in 1k) echo 0.06 ;; 10k) echo 0.7 ;; 100k) echo 6.6 ;; esac; }
 
 for value in $SHARING;    do case $value in on|off) ;; *) echo "bad sharing '$value'" >&2; exit 2 ;; esac; done
 for value in $POLICIES;   do case $value in lru|fifo) ;; *) echo "bad policy '$value'" >&2; exit 2 ;; esac; done
