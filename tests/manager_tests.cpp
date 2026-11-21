@@ -329,6 +329,42 @@ void prefix_reuse_tests() {
     CHECK(manager.check_invariants());
 }
 
+// RELEASE tells the policy which cached blocks became evictable: only indexed
+// leaves that no request holds any more (B = 2).
+void release_tests() {
+    Config config = small_config(true);
+    config.capacity = 8;
+    KVCacheManager manager(config);
+    using Blocks = std::vector<BlockId>;
+    CHECK(manager.admit("a", {1, 2, 3, 4}).blocks == Blocks({0, 1}));
+    CHECK(manager.fork("b", "a").blocks == Blocks({0, 1}));
+    CHECK(manager.block_references(1) == 3);
+    // b still holds both blocks: nothing is freed and nothing is evictable.
+    CHECK(manager.release("a").freed.empty() && manager.evictable_blocks() == 0);
+    // Last holder gone: leaf 1 is evictable; its parent 0 is not (it has a child).
+    CHECK(manager.release("b").freed.empty() && manager.evictable_blocks() == 1);
+    CHECK(manager.block_references(0) == 1 && manager.block_references(1) == 1);
+    CHECK(manager.check_invariants());
+
+    // Holding only the parent leaves the leaf evictable, before and after.
+    OpResult result = manager.admit("c", {1, 2});
+    CHECK(result.blocks == Blocks({0}) && result.cached_tokens == 2);
+    CHECK(manager.evictable_blocks() == 1);
+    CHECK(manager.release("c").freed.empty() && manager.evictable_blocks() == 1);
+    // Holding the leaf pins it; releasing makes it evictable again.
+    CHECK(manager.admit("d", {1, 2, 3, 4}).cached_tokens == 4);
+    CHECK(manager.evictable_blocks() == 0 && manager.check_invariants());
+    CHECK(manager.release("d").freed.empty() && manager.evictable_blocks() == 1);
+
+    // A shared partial tail is not indexed: it is freed by its last holder.
+    CHECK(manager.admit("e", {8}).blocks == Blocks({2}));
+    CHECK(manager.fork("f", "e").blocks == Blocks({2}));
+    CHECK(manager.release("e").freed.empty());
+    CHECK(manager.release("f").freed == Blocks({2}));
+    CHECK(manager.indexed_blocks() == 2 && manager.evictable_blocks() == 1);
+    CHECK(manager.stats().used_blocks == 2 && manager.check_invariants());
+}
+
 int main() {
     try {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
@@ -338,6 +374,7 @@ int main() {
         wiring_tests(); std::cout << "PASS index and policy wiring\n";
         indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
         prefix_reuse_tests(); std::cout << "PASS hand-calculated prefix-reuse trace\n";
+        release_tests(); std::cout << "PASS release marks unheld cached leaves evictable\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;
