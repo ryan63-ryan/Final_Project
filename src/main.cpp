@@ -253,6 +253,9 @@ RunReport run_trace(std::istream& trace, KVCacheManager& manager, bool check) {
             continue;
         }
         if (rejected.count(command.req) || rejected.count(command.src)) {
+            // A fork of a rejected request is never created either, so the
+            // commands of the fork are skipped as well.
+            if (command.type == CommandType::Fork) rejected.insert(command.req);
             ++report.skipped_ops;
             continue;
         }
