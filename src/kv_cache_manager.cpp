@@ -117,27 +117,41 @@ void KVCacheManager::note_usage() {
 OpResult KVCacheManager::admit(const RequestId& id, const std::vector<Token>& prompt) {
     if (has_request(id)) return fail(Status::Error, "duplicate request ID '" + id + "'");
 
-    // TODO(integration): with the prefix cache, look up the longest cached run of
-    // full blocks here, start the table with BlockTable::from_prefix, and count
-    // evictable blocks as available capacity.
-    auto needed = blocks_for(prompt.size());
+    // Prefix cache: the longest run of full blocks already stored for the start
+    // of this prompt. from_prefix pins them (one reference each) before anything
+    // else happens; on Reject the table is destroyed and the pins are dropped.
+    std::vector<BlockId> hit;
+    if (config_.sharing) hit = tree_.match(prompt);
+    BlockTable table = BlockTable::from_prefix(*pool_, hit);
+    const auto cached = table.token_count();
+
+    // TODO(integration): count evictable blocks as available capacity.
+    auto needed = blocks_for(prompt.size()) - hit.size();
     if (needed > pool_->free_count())
         return fail(Status::Reject, "needs " + std::to_string(needed) + " blocks, " +
                                         std::to_string(pool_->free_count()) + " free");
 
-    BlockTable table(*pool_);
+    // The reused blocks were accessed, and the deepest one may have been an
+    // evictable leaf until this request pinned it (the others have children).
+    for (BlockId block : hit) policy_->on_access(block);
+    if (!hit.empty()) policy_->set_evictable(hit.back(), false);
+
+    // The cached tokens are not written again, but they still advance the hash.
     auto hash = initial_prefix_hash(config_.seed);
-    for (Token token : prompt)
-        if (!table.append(next_payload(hash, token)))
+    for (std::size_t i = 0; i < cached; ++i) hash = next_prefix_hash(hash, prompt[i]);
+    for (std::size_t i = cached; i < prompt.size(); ++i)
+        if (!table.append(next_payload(hash, prompt[i])))
             throw std::logic_error("admit ran out of blocks after its capacity check");
 
     OpResult result;
     result.blocks = table.blocks();
+    result.cached_tokens = cached;
     auto added = requests_.emplace(id, RequestState{prompt, hash, std::move(table)}).first;
     index_full_blocks(added->second);
     ++stats_.admitted;
     stats_.prompt_tokens += prompt.size();
-    stats_.uncached_tokens += prompt.size();
+    stats_.cached_tokens += cached;
+    stats_.uncached_tokens += prompt.size() - cached;
     note_usage();
     return result;
 }

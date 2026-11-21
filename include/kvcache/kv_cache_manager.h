@@ -50,11 +50,12 @@ struct Stats {
 // Every operation is all-or-nothing. Capacity is checked before anything is
 // changed, so Reject and Error leave the manager exactly as it was.
 //
-// Current scope: no prefix cache yet (RadixTree / EvictionPolicy are not merged).
-//   sharing=on   FORK shares blocks and APPEND copies on write; ADMIT always
-//                allocates fresh blocks (cached_tokens is 0).
-//   sharing=off  baseline: FORK copies every token into fresh blocks, so no
-//                block is ever shared.
+//   sharing=on   ADMIT reuses the longest cached run of full blocks found in the
+//                prefix index and writes only the rest; every block a request
+//                fills is indexed. FORK shares blocks and APPEND copies on write.
+//   sharing=off  baseline: the index is never used, ADMIT always allocates
+//                fresh blocks and FORK copies every token, so no block is ever
+//                shared.
 class KVCacheManager {
 public:
     explicit KVCacheManager(const Config& config);

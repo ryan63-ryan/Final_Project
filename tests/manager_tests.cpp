@@ -64,6 +64,19 @@ void payload_tests() {
     CHECK(manager.check_invariants() && reseeded.check_invariants());
 }
 
+// What a request holding `tokens` must read, computed from the tokens alone.
+Payload expected_bytes(const std::vector<Token>& tokens, std::uint64_t seed = 42,
+                       std::size_t width = 64) {
+    Payload bytes;
+    auto hash = initial_prefix_hash(seed);
+    for (Token token : tokens) {
+        hash = next_prefix_hash(hash, token);
+        Payload payload = make_payload(hash, width);
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+    }
+    return bytes;
+}
+
 // The proposal example (tests/golden/example.trace), checked step by step.
 void cow_tests() {
     KVCacheManager manager(small_config(true));
@@ -90,12 +103,16 @@ void cow_tests() {
     CHECK(result.status == Status::Ok && result.freed == std::vector<BlockId>({1}));
     CHECK(!manager.has_request("r1") && manager.read_request("r2") == r2);
 
-    // The fork carried the running hash: r2 equals a request admitted in one go.
-    CHECK(manager.admit("direct", {10, 11, 12, 13}).status == Status::Ok);
-    CHECK(manager.read_request("direct") == r2);
+    // The fork carried the running hash: r2 equals a request admitted in one go,
+    // which in fact finds both of r2's full blocks in the prefix cache.
+    result = manager.admit("direct", {10, 11, 12, 13});
+    CHECK(result.status == Status::Ok && result.blocks == std::vector<BlockId>({0, 2}));
+    CHECK(result.cached_tokens == 4 && manager.read_request("direct") == r2);
+    CHECK(r2 == expected_bytes({10, 11, 12, 13}));
     Stats stats = manager.stats();
     CHECK(stats.cow_copies == 1 && stats.admitted == 2 && stats.prompt_tokens == 7);
-    CHECK(stats.used_blocks == 4 && stats.peak_used_blocks == 4 && stats.fragmentation_slots == 0);
+    CHECK(stats.cached_tokens == 4 && stats.uncached_tokens == 3);
+    CHECK(stats.used_blocks == 2 && stats.peak_used_blocks == 3 && stats.fragmentation_slots == 0);
     CHECK(manager.check_invariants());
 }
 
@@ -129,7 +146,8 @@ void failure_tests() {
     CHECK(manager.fork("r2", "nobody").status == Status::Error);
     CHECK(manager.fork("r1", "r1").status == Status::Error);
     CHECK(manager.release("nobody").status == Status::Error);
-    CHECK(manager.admit("big", {1, 2, 3, 4, 5}).status == Status::Reject);
+    // No cached prefix (first token differs from r1's): 3 blocks needed, 2 free.
+    CHECK(manager.admit("big", {9, 2, 3, 4, 5}).status == Status::Reject);
     CHECK(!manager.has_request("big") && !manager.has_request("r2"));
     CHECK(manager.read_request("r1") == r1 && manager.stats().used_blocks == 2);
 
@@ -233,6 +251,84 @@ void indexing_tests() {
     CHECK(manager.block_references(result.blocks.at(0)) == 3 && manager.check_invariants());
 }
 
+// Hand-calculated prefix-reuse trace. B = 2, capacity 8, blocks are handed out
+// in the order 0, 1, 2, ... while none has been freed.
+//
+//   op                         match    cached  blocks    new blocks
+//   ADMIT p1 1 2 3 4 5         -        0       [0,1,2]   0=[1,2] 1=[3,4] 2=[5]
+//   ADMIT p2 1 2 3 4 9 9       [0,1]    4       [0,1,3]   3=[9,9]
+//   ADMIT p3 1 2 7             [0]      2       [0,4]     4=[7]
+//   ADMIT p4 5 2 3 4           -        0       [5,6]     5=[5,2] 6=[3,4]
+//   ADMIT p5 1 2 3 4           [0,1]    4       [0,1]     none
+//   APPEND p5 5                                 [0,1,7]   7=[5]
+//
+// Indexed (full) blocks: 0, 1, 3, 5, 6. Partial tails 2, 4, 7 are never shared,
+// even though blocks 2 and 7 hold the same token after the same prefix.
+// References = requests holding the block + 1 if indexed:
+//   0: p1 p2 p3 p5 + index = 5     1: p1 p2 p5 + index = 4     3: p2 + index = 2
+void prefix_reuse_tests() {
+    Config config = small_config(true);
+    config.capacity = 8;
+    KVCacheManager manager(config);
+    using Blocks = std::vector<BlockId>;
+
+    OpResult result = manager.admit("p1", {1, 2, 3, 4, 5});
+    CHECK(result.blocks == Blocks({0, 1, 2}) && result.cached_tokens == 0);
+    result = manager.admit("p2", {1, 2, 3, 4, 9, 9});
+    CHECK(result.blocks == Blocks({0, 1, 3}) && result.cached_tokens == 4);
+    result = manager.admit("p3", {1, 2, 7});
+    CHECK(result.blocks == Blocks({0, 4}) && result.cached_tokens == 2);
+    // Same tokens 2 3 4 at the same positions, but a different first token:
+    // nothing may be reused, and block 6 = [3,4] differs from block 1 = [3,4].
+    result = manager.admit("p4", {5, 2, 3, 4});
+    CHECK(result.blocks == Blocks({5, 6}) && result.cached_tokens == 0);
+    // A prompt that is cached completely needs no new block.
+    result = manager.admit("p5", {1, 2, 3, 4});
+    CHECK(result.blocks == Blocks({0, 1}) && result.cached_tokens == 4);
+    CHECK(manager.stats().used_blocks == 7);
+    result = manager.append("p5", 5);
+    CHECK(result.blocks == Blocks({0, 1, 7}) && result.cow_copies == 0);
+
+    CHECK(manager.block_references(0) == 5 && manager.block_references(1) == 4);
+    CHECK(manager.block_references(3) == 2 && manager.block_references(2) == 1);
+    CHECK(manager.indexed_blocks() == 5 && manager.evictable_blocks() == 0);
+    for (BlockId block : {0, 1, 3, 5, 6}) CHECK(manager.is_indexed(block));
+    for (BlockId block : {2, 4, 7}) CHECK(!manager.is_indexed(block));
+
+    // Every request reads exactly what it would read without any sharing.
+    CHECK(manager.read_request("p1") == expected_bytes({1, 2, 3, 4, 5}));
+    CHECK(manager.read_request("p2") == expected_bytes({1, 2, 3, 4, 9, 9}));
+    CHECK(manager.read_request("p3") == expected_bytes({1, 2, 7}));
+    CHECK(manager.read_request("p4") == expected_bytes({5, 2, 3, 4}));
+    CHECK(manager.read_request("p5") == expected_bytes({1, 2, 3, 4, 5}));
+    Stats stats = manager.stats();
+    CHECK(stats.prompt_tokens == 22 && stats.cached_tokens == 10 && stats.uncached_tokens == 12);
+    CHECK(stats.used_blocks == 8 && stats.fragmentation_slots == 3);
+    CHECK(manager.check_invariants());
+
+    // Reject with a partial hit: needs 1 block beyond [0,1], none free and none
+    // evictable. The pins taken for the match are dropped again.
+    result = manager.admit("p6", {1, 2, 3, 4, 8});
+    CHECK(result.status == Status::Reject && !manager.has_request("p6"));
+    CHECK(manager.block_references(0) == 5 && manager.block_references(1) == 4);
+    CHECK(manager.stats().cached_tokens == 10 && manager.check_invariants());
+
+    // The cache outlives the requests that filled it. Releasing p1, p2 and p5
+    // frees only their partial tails (2 and 7); 0, 1, 3 stay cached and block 3
+    // becomes the evictable leaf. p7 then reuses all three.
+    CHECK(manager.release("p1").freed == Blocks({2}));
+    CHECK(manager.release("p2").freed.empty());
+    CHECK(manager.release("p5").freed == Blocks({7}));
+    CHECK(manager.block_references(0) == 2 && manager.block_references(1) == 1);
+    CHECK(manager.block_references(3) == 1 && manager.evictable_blocks() == 1);
+    result = manager.admit("p7", {1, 2, 3, 4, 9, 9, 1});
+    CHECK(result.status == Status::Ok && result.cached_tokens == 6);
+    CHECK(result.blocks.size() == 4 && result.blocks[0] == 0 && result.blocks[1] == 1);
+    CHECK(result.blocks[2] == 3 && manager.evictable_blocks() == 0);
+    CHECK(manager.read_request("p7") == expected_bytes({1, 2, 3, 4, 9, 9, 1}));
+    CHECK(manager.check_invariants());
+}
+
 int main() {
     try {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
@@ -241,6 +337,7 @@ int main() {
         failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact\n";
         wiring_tests(); std::cout << "PASS index and policy wiring\n";
         indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
+        prefix_reuse_tests(); std::cout << "PASS hand-calculated prefix-reuse trace\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;
