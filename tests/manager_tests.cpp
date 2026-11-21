@@ -158,9 +158,12 @@ void failure_tests() {
     target = std::move(moved);
     CHECK(!target.has_request("old") && target.read_request("fill") == fill);
     CHECK(target.check_invariants());
-    // Blocks 0-1 hold r1, 2-3 hold fill; nothing is free or over-counted.
-    CHECK(target.block_references(0) == 1 && target.block_references(3) == 1);
-    CHECK(target.release("fill").status == Status::Ok && target.block_references(3) == 0);
+    // The index moved too: blocks 0-1 (r1) and 2-3 (fill) are full, so each has
+    // its request's reference plus the index's. Releasing fill leaves them cached.
+    CHECK(target.indexed_blocks() == 4 && target.block_references(0) == 2);
+    CHECK(target.block_references(3) == 2);
+    CHECK(target.release("fill").freed.empty() && target.block_references(3) == 1);
+    CHECK(target.evictable_blocks() == 1 && target.check_invariants());
 }
 
 // Both policies and both sharing modes construct, and an empty prefix cache
@@ -178,6 +181,58 @@ void wiring_tests() {
         }
 }
 
+// Full blocks enter the prefix index as requests fill them (B = 2).
+void indexing_tests() {
+    Config config = small_config(true);
+    config.capacity = 8;
+    KVCacheManager manager(config);
+    // ADMIT: block 0 = [1,2] is full and indexed; block 1 = [3] is partial.
+    CHECK(manager.admit("r1", {1, 2, 3}).blocks == std::vector<BlockId>({0, 1}));
+    CHECK(manager.is_indexed(0) && !manager.is_indexed(1) && manager.indexed_blocks() == 1);
+    CHECK(manager.block_references(0) == 2 && manager.block_references(1) == 1);
+    // APPEND fills block 1, which is indexed under block 0.
+    CHECK(manager.append("r1", 4).status == Status::Ok);
+    CHECK(manager.is_indexed(1) && manager.block_references(1) == 2);
+    CHECK(manager.evictable_blocks() == 0 && manager.check_invariants());
+
+    // Two requests fill the same prefix independently: the first block to
+    // become full is indexed, the second stays private.
+    CHECK(manager.admit("a", {7}).blocks == std::vector<BlockId>({2}));
+    CHECK(manager.admit("b", {7}).blocks == std::vector<BlockId>({3}));
+    CHECK(manager.append("a", 8).status == Status::Ok);
+    CHECK(manager.append("b", 8).status == Status::Ok);
+    CHECK(manager.is_indexed(2) && !manager.is_indexed(3));
+    CHECK(manager.block_references(2) == 2 && manager.block_references(3) == 1);
+    CHECK(manager.read_request("a") == manager.read_request("b"));
+
+    // RELEASE keeps indexed blocks cached; only the leaf becomes evictable.
+    OpResult result = manager.release("r1");
+    CHECK(result.status == Status::Ok && result.freed.empty());
+    CHECK(manager.block_references(0) == 1 && manager.block_references(1) == 1);
+    CHECK(manager.indexed_blocks() == 3 && manager.evictable_blocks() == 1);
+    CHECK(manager.release("a").freed.empty() && manager.evictable_blocks() == 2);
+
+    // b holds private block 3 for [7,8]; its next full block [9,10] is indexed
+    // under cached block 2, which then stops being a leaf and is not evictable.
+    CHECK(manager.append("b", 9).blocks == std::vector<BlockId>({3, 4}));
+    CHECK(!manager.is_indexed(4) && manager.evictable_blocks() == 2);
+    CHECK(manager.append("b", 10).status == Status::Ok);
+    CHECK(manager.is_indexed(4) && manager.block_references(4) == 2);
+    CHECK(manager.evictable_blocks() == 1 && manager.check_invariants());
+    // Releasing b frees its private block; block 4 is now the evictable leaf.
+    CHECK(manager.release("b").freed == std::vector<BlockId>({3}));
+    CHECK(manager.indexed_blocks() == 4 && manager.evictable_blocks() == 2);
+    CHECK(manager.stats().used_blocks == 4 && manager.check_invariants());
+
+    // A fork shares blocks; the block it fills by copy-on-write is indexed too.
+    CHECK(manager.admit("f1", {20, 21, 22}).status == Status::Ok);
+    CHECK(manager.fork("f2", "f1").status == Status::Ok);
+    result = manager.append("f2", 23);
+    CHECK(result.status == Status::Ok && result.cow_copies == 1);
+    CHECK(manager.is_indexed(result.blocks.at(1)) && manager.indexed_blocks() == 6);
+    CHECK(manager.block_references(result.blocks.at(0)) == 3 && manager.check_invariants());
+}
+
 int main() {
     try {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
@@ -185,6 +240,7 @@ int main() {
         baseline_tests(); std::cout << "PASS sharing=off baseline\n";
         failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact\n";
         wiring_tests(); std::cout << "PASS index and policy wiring\n";
+        indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

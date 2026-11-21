@@ -76,6 +76,29 @@ std::size_t KVCacheManager::blocks_for(std::size_t tokens) const {
     return tokens / width + (tokens % width != 0 ? 1 : 0);
 }
 
+void KVCacheManager::index_full_blocks(const RequestState& state) {
+    if (!config_.sharing) return;
+    const auto width = pool_->tokens_per_block();
+    const auto full = state.tokens.size() / width;
+    // Levels below `covered` are already indexed, by this request's blocks or by
+    // equal blocks of another request (then ours stay private). Start at the
+    // first uncovered level rather than only the newest block: an ancestor that
+    // was indexed by someone else may have been evicted since, and
+    // RadixTree::insert needs the parent prefix, so the chain is healed with
+    // this request's own blocks from that level down.
+    const auto covered = tree_.match(state.tokens).size();
+    for (std::size_t level = covered; level < full; ++level) {
+        BlockId block = state.table.blocks()[level];
+        std::vector<Token> prefix(state.tokens.begin(),
+                                  state.tokens.begin() + (level + 1) * width);
+        if (!tree_.insert(prefix, block))
+            throw std::logic_error("uncovered prefix was already indexed");
+        policy_->on_insert(block); // starts not evictable: this request holds it
+        // A cached leaf that just gained a child is no longer evictable.
+        if (auto parent = tree_.parent(block)) policy_->set_evictable(*parent, false);
+    }
+}
+
 OpResult KVCacheManager::fail(Status status, const std::string& message) {
     if (status == Status::Reject) ++stats_.rejected;
     else ++stats_.errors;
@@ -110,7 +133,8 @@ OpResult KVCacheManager::admit(const RequestId& id, const std::vector<Token>& pr
 
     OpResult result;
     result.blocks = table.blocks();
-    requests_.emplace(id, RequestState{prompt, hash, std::move(table)});
+    auto added = requests_.emplace(id, RequestState{prompt, hash, std::move(table)}).first;
+    index_full_blocks(added->second);
     ++stats_.admitted;
     stats_.prompt_tokens += prompt.size();
     stats_.uncached_tokens += prompt.size();
@@ -139,7 +163,7 @@ OpResult KVCacheManager::append(const RequestId& id, Token token) {
         throw std::logic_error("append ran out of blocks after its capacity check");
     state.prefix_hash = hash;
     state.tokens.push_back(token);
-    // TODO(integration): if the tail block just became full, insert it in the index.
+    if (state.tokens.size() % pool_->tokens_per_block() == 0) index_full_blocks(state);
 
     OpResult result;
     result.blocks = state.table.blocks();
@@ -186,10 +210,15 @@ OpResult KVCacheManager::release(const RequestId& id) {
     if (it == requests_.end()) return fail(Status::Error, "unknown request '" + id + "'");
 
     // A block whose only reference is this request goes back to the free list.
+    // An indexed block also has the index's reference, so it stays cached.
     OpResult result;
-    for (BlockId block : it->second.table.blocks())
+    const std::vector<BlockId> blocks = it->second.table.blocks();
+    for (BlockId block : blocks)
         if (pool_->references(block) == 1) result.freed.push_back(block);
     requests_.erase(it); // ~BlockTable releases every reference
+    // A cached leaf that no request holds any more becomes evictable.
+    for (BlockId block : blocks)
+        if (tree_.contains(block)) policy_->set_evictable(block, tree_.is_evictable(block));
     return result;
 }
 

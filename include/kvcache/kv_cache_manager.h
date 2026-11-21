@@ -95,6 +95,9 @@ private:
     // Hashes one more token into `hash` and returns the payload to store for it.
     Payload next_payload(std::uint64_t& hash, Token token) const;
     std::size_t blocks_for(std::size_t tokens) const;
+    // Puts every full block of `state` that the index does not cover yet into
+    // the index and tells the policy. No-op when sharing=off.
+    void index_full_blocks(const RequestState& state);
     OpResult fail(Status status, const std::string& message);
     void note_usage();
 
