@@ -1,6 +1,8 @@
 #include "kvcache/kv_cache_manager.h"
 
 #include <iostream>
+#include <map>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -365,6 +367,233 @@ void release_tests() {
     CHECK(manager.stats().used_blocks == 2 && manager.check_invariants());
 }
 
+// Hand-calculated eviction trace, run once per policy. B = 2, capacity 4.
+// The free list is a stack: the block freed last is allocated first.
+// "rank" is the policy's clock value; the evictable block with the smallest
+// rank is the victim. Only LRU gives a block a new rank when it is reused.
+//
+//  #  op                   LRU                              FIFO
+//  1  ADMIT a 1 2          blocks [0]                       same
+//  2  ADMIT b 3 4          blocks [1]                       same
+//  3  ADMIT c 5 6          blocks [2]                       same
+//  4  RELEASE a, b, c      evictable {0,1,2}, free {3}      same
+//                          ranks 0:1 1:2 2:3                ranks 0:1 1:2 2:3
+//  5  ADMIT d 1 2          hit [0], cached 2; rank 0:4      hit [0], cached 2; rank 0:1
+//  6  RELEASE d            evictable {0,1,2}                evictable {0,1,2}
+//  7  ADMIT e 7 8 9 10     needs 2, free 1: evict 1         needs 2, free 1: evict 0
+//                          blocks [1,3]; ranks 1:5 3:6      blocks [0,3]; ranks 0:4 3:5
+//  8  ADMIT f 1 2          hit [0], cached 2; rank 0:7      miss: evict 1, blocks [1]
+//                                                           cached 0; rank 1:6
+//  9  RELEASE e            evictable {2,3}                  evictable {2,3}
+//                          (1 = [7,8] has child 3)          (0 = [7,8] has child 3)
+// 10  ADMIT g 20..24       needs 3, free 0, evictable 2,    needs 3, free 0, evictable 2,
+//                          reclaimable 3 (2, 3, then 1)     reclaimable 3 (2, 3, then 0)
+//                          evict 2, 3, 1; blocks [1,3,2]    evict 2, 3, 0; blocks [0,3,2]
+//
+// Totals: LRU 4 evictions, 4 cached tokens; FIFO 5 evictions, 2 cached tokens.
+// Step 8 is the difference: LRU kept the block that d had just reused.
+// Step 10 needs the cascade: only two leaves are evictable, the third block
+// becomes one after its child is evicted.
+void eviction_trace_tests() {
+    using Blocks = std::vector<BlockId>;
+    for (PolicyKind kind : {PolicyKind::LRU, PolicyKind::FIFO}) {
+        const bool lru = kind == PolicyKind::LRU;
+        Config config = small_config(true);
+        config.policy = kind;
+        KVCacheManager manager(config);
+
+        CHECK(manager.admit("a", {1, 2}).blocks == Blocks({0}));
+        CHECK(manager.admit("b", {3, 4}).blocks == Blocks({1}));
+        CHECK(manager.admit("c", {5, 6}).blocks == Blocks({2}));
+        for (const char* id : {"a", "b", "c"}) CHECK(manager.release(id).freed.empty());
+        CHECK(manager.evictable_blocks() == 3 && manager.stats().used_blocks == 3);
+
+        OpResult result = manager.admit("d", {1, 2});
+        CHECK(result.blocks == Blocks({0}) && result.cached_tokens == 2);
+        CHECK(result.evicted.empty() && manager.evictable_blocks() == 2);
+        CHECK(manager.release("d").freed.empty() && manager.evictable_blocks() == 3);
+
+        result = manager.admit("e", {7, 8, 9, 10});
+        CHECK(result.status == Status::Ok && result.cached_tokens == 0);
+        CHECK(result.evicted == (lru ? Blocks({1}) : Blocks({0})));
+        CHECK(result.blocks == (lru ? Blocks({1, 3}) : Blocks({0, 3})));
+        CHECK(manager.evictable_blocks() == 2 && manager.check_invariants());
+
+        result = manager.admit("f", {1, 2});
+        CHECK(result.status == Status::Ok);
+        CHECK(result.cached_tokens == (lru ? 2u : 0u));
+        CHECK(result.evicted == (lru ? Blocks({}) : Blocks({1})));
+        CHECK(result.blocks == (lru ? Blocks({0}) : Blocks({1})));
+        CHECK(manager.read_request("f") == expected_bytes({1, 2}));
+        CHECK(manager.evictable_blocks() == 1); // block 2 = [5,6]
+
+        CHECK(manager.release("e").freed.empty());
+        CHECK(manager.evictable_blocks() == 2 && manager.stats().used_blocks == 4);
+        CHECK(manager.check_invariants());
+
+        // Three blocks are needed but only two leaves are evictable right now.
+        result = manager.admit("g", {20, 21, 22, 23, 24});
+        CHECK(result.status == Status::Ok && result.cached_tokens == 0);
+        CHECK(result.evicted == (lru ? Blocks({2, 3, 1}) : Blocks({2, 3, 0})));
+        CHECK(result.blocks == (lru ? Blocks({1, 3, 2}) : Blocks({0, 3, 2})));
+        CHECK(manager.read_request("g") == expected_bytes({20, 21, 22, 23, 24}));
+        CHECK(manager.read_request("f") == expected_bytes({1, 2}));
+
+        Stats stats = manager.stats();
+        CHECK(stats.evictions == (lru ? 4u : 5u) && stats.cached_tokens == (lru ? 4u : 2u));
+        CHECK(stats.prompt_tokens == 19 && stats.rejected == 0 && stats.used_blocks == 4);
+        CHECK(manager.indexed_blocks() == 3 && manager.evictable_blocks() == 0);
+        CHECK(manager.check_invariants());
+    }
+}
+
+// Capacity checks with eviction: all-or-nothing, and a matched prefix is never
+// evicted to make room for the request that matched it.
+void eviction_capacity_tests() {
+    using Blocks = std::vector<BlockId>;
+    Config config = small_config(true);
+    config.capacity = 2;
+    KVCacheManager manager(config);
+    CHECK(manager.admit("a", {1, 2, 3, 4}).blocks == Blocks({0, 1}));
+    // Everything is held: no room, by ADMIT or by APPEND.
+    CHECK(manager.admit("x", {9}).status == Status::Reject);
+    CHECK(manager.append("a", 5).status == Status::Reject);
+    CHECK(manager.release("a").freed.empty() && manager.evictable_blocks() == 1);
+
+    // h matches both cached blocks and needs a third. The only cached blocks
+    // are the ones it uses, so it is rejected and nothing is evicted.
+    OpResult result = manager.admit("h", {1, 2, 3, 4, 5});
+    CHECK(result.status == Status::Reject && result.evicted.empty());
+    CHECK(result.message == "needs 1 block, 0 free, 0 evictable");
+    CHECK(manager.indexed_blocks() == 2 && manager.evictable_blocks() == 1);
+    CHECK(manager.block_references(0) == 1 && manager.block_references(1) == 1);
+    CHECK(manager.stats().evictions == 0 && manager.check_invariants());
+    // Needs 3 with 2 reclaimable: rejected before a single block is evicted.
+    result = manager.admit("big", {9, 9, 9, 9, 9});
+    CHECK(result.status == Status::Reject);
+    CHECK(result.message == "needs 3 blocks, 0 free, 2 evictable");
+    CHECK(manager.indexed_blocks() == 2 && manager.stats().evictions == 0);
+
+    // i reuses block 0 and takes the place of the evicted leaf 1.
+    result = manager.admit("i", {1, 2, 9});
+    CHECK(result.status == Status::Ok && result.cached_tokens == 2);
+    CHECK(result.evicted == Blocks({1}) && result.blocks == Blocks({0, 1}));
+    CHECK(manager.read_request("i") == expected_bytes({1, 2, 9}));
+    // i fills block 1; its next token needs a block, and none is free or
+    // evictable while i itself holds both. APPEND evicts as well: once i is
+    // released, k's append takes the cached leaf [9,9].
+    CHECK(manager.append("i", 9).status == Status::Ok);
+    CHECK(manager.append("i", 9).status == Status::Reject);
+    CHECK(manager.release("i").freed.empty() && manager.evictable_blocks() == 1);
+    CHECK(manager.admit("k", {1, 2}).blocks == Blocks({0}));
+    result = manager.append("k", 7);
+    CHECK(result.status == Status::Ok && result.evicted == Blocks({1}));
+    CHECK(result.blocks == Blocks({0, 1}) && manager.stats().evictions == 2);
+    CHECK(manager.read_request("k") == expected_bytes({1, 2, 7}));
+    CHECK(manager.check_invariants());
+}
+
+// An ancestor indexed by another request is evicted while this request still
+// holds a private copy of it; the next block it fills must heal the chain.
+// B = 4, capacity 3.
+void heal_tests() {
+    using Blocks = std::vector<BlockId>;
+    Config config = small_config(true);
+    config.capacity = 3;
+    config.tokens_per_block = 4;
+    KVCacheManager manager(config);
+    CHECK(manager.admit("r1", {1, 2, 3}).blocks == Blocks({0}));
+    CHECK(manager.admit("r2", {1, 2, 3}).blocks == Blocks({1}));
+    CHECK(manager.append("r1", 4).status == Status::Ok); // block 0 is indexed
+    CHECK(manager.append("r2", 4).status == Status::Ok); // block 1 stays private
+    CHECK(manager.is_indexed(0) && !manager.is_indexed(1));
+    CHECK(manager.release("r1").freed.empty() && manager.evictable_blocks() == 1);
+
+    // Fill the pool, then r2's next token evicts block 0 and reuses it.
+    CHECK(manager.admit("x", {9}).blocks == Blocks({2}));
+    OpResult result = manager.append("r2", 5);
+    CHECK(result.status == Status::Ok && result.evicted == Blocks({0}));
+    CHECK(result.blocks == Blocks({1, 0}) && manager.indexed_blocks() == 0);
+    CHECK(manager.check_invariants());
+
+    // r2 fills its second block. Prefix [1,2,3,4] is no longer indexed, so both
+    // of r2's blocks are inserted: its private block 1, then block 0 under it.
+    CHECK(manager.append("r2", 6).status == Status::Ok);
+    CHECK(manager.append("r2", 7).status == Status::Ok && manager.indexed_blocks() == 0);
+    CHECK(manager.append("r2", 8).status == Status::Ok);
+    CHECK(manager.indexed_blocks() == 2 && manager.is_indexed(1) && manager.is_indexed(0));
+    CHECK(manager.block_references(1) == 2 && manager.block_references(0) == 2);
+    CHECK(manager.evictable_blocks() == 0 && manager.check_invariants());
+    CHECK(manager.read_request("r2") == expected_bytes({1, 2, 3, 4, 5, 6, 7, 8}));
+
+    // The healed chain is usable: a new request finds both blocks.
+    result = manager.admit("y", {1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(result.status == Status::Ok && result.cached_tokens == 8);
+    CHECK(result.blocks == Blocks({1, 0}) && manager.check_invariants());
+}
+
+// Seeded random traces on a small pool with a tiny token alphabet, so prefixes
+// collide and eviction runs constantly. After every operation the invariants
+// hold and the touched request reads what its tokens alone determine; a Reject
+// changes nothing.
+void random_tests() {
+    const char* names[] = {"q0", "q1", "q2", "q3", "q4", "q5"};
+    std::size_t operations = 0;
+    for (PolicyKind kind : {PolicyKind::LRU, PolicyKind::FIFO})
+        for (bool sharing : {true, false})
+            for (unsigned seed = 1; seed <= 20; ++seed) {
+                Config config = small_config(sharing);
+                config.capacity = 10;
+                config.bytes_per_token = 8;
+                config.policy = kind;
+                KVCacheManager manager(config);
+                std::mt19937 random(seed);
+                std::map<std::string, std::vector<Token>> model;
+                auto pick = [&](unsigned n) { return static_cast<unsigned>(random() % n); };
+                for (int step = 0; step < 300; ++step, ++operations) {
+                    std::string id = names[pick(6)];
+                    Stats before = manager.stats();
+                    auto indexed = manager.indexed_blocks();
+                    OpResult result;
+                    unsigned op = pick(10);
+                    if (!model.count(id) && op < 7) {
+                        std::vector<Token> prompt(pick(8));
+                        for (Token& token : prompt) token = static_cast<Token>(pick(2));
+                        result = manager.admit(id, prompt);
+                        if (result.status == Status::Ok) model[id] = prompt;
+                    } else if (!model.count(id)) {
+                        std::string source = names[pick(6)];
+                        result = manager.fork(id, source);
+                        CHECK((result.status == Status::Error) == !model.count(source));
+                        if (result.status == Status::Ok) model[id] = model[source];
+                    } else if (op < 7) {
+                        Token token = static_cast<Token>(pick(2));
+                        result = manager.append(id, token);
+                        if (result.status == Status::Ok) model[id].push_back(token);
+                    } else {
+                        result = manager.release(id);
+                        CHECK(result.status == Status::Ok);
+                        model.erase(id);
+                    }
+                    CHECK(manager.check_invariants());
+                    Stats after = manager.stats();
+                    if (result.status != Status::Ok) {
+                        CHECK(result.evicted.empty() && after.evictions == before.evictions);
+                        CHECK(after.used_blocks == before.used_blocks);
+                        CHECK(manager.indexed_blocks() == indexed);
+                    }
+                    CHECK(after.evictions == before.evictions + result.evicted.size());
+                    CHECK(after.cached_tokens + after.uncached_tokens == after.prompt_tokens);
+                    if (!sharing) CHECK(after.evictions == 0 && after.cached_tokens == 0);
+                    for (const auto& entry : model)
+                        CHECK(manager.read_request(entry.first) ==
+                              expected_bytes(entry.second, 42, 8));
+                    CHECK(manager.has_request(id) == (model.count(id) != 0));
+                }
+            }
+    CHECK(operations == 24000);
+}
+
 int main() {
     try {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
@@ -375,6 +604,10 @@ int main() {
         indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
         prefix_reuse_tests(); std::cout << "PASS hand-calculated prefix-reuse trace\n";
         release_tests(); std::cout << "PASS release marks unheld cached leaves evictable\n";
+        eviction_trace_tests(); std::cout << "PASS hand-calculated LRU and FIFO eviction trace\n";
+        eviction_capacity_tests(); std::cout << "PASS eviction capacity checks are all-or-nothing\n";
+        heal_tests(); std::cout << "PASS evicted ancestor is healed from the request's own blocks\n";
+        random_tests(); std::cout << "PASS 24000 seeded manager operations\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

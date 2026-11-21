@@ -99,6 +99,47 @@ void KVCacheManager::index_full_blocks(const RequestState& state) {
     }
 }
 
+std::size_t KVCacheManager::reclaimable_blocks() const {
+    // A block is stuck if a request holds it or any block below it: leaves go
+    // first, so it can never become an evictable leaf. Mark every held indexed
+    // block and walk up; stop at a marked block, whose ancestors are marked too.
+    std::vector<bool> stuck(pool_->capacity(), false);
+    std::size_t stuck_count = 0;
+    for (BlockId id = 0; id < pool_->capacity(); ++id) {
+        if (!tree_.contains(id) || pool_->references(id) == 1) continue;
+        for (std::optional<BlockId> block = id; block && !stuck[*block];
+             block = tree_.parent(*block)) {
+            stuck[*block] = true;
+            ++stuck_count;
+        }
+    }
+    return tree_.size() - stuck_count;
+}
+
+bool KVCacheManager::has_room(std::size_t needed) const {
+    auto free = pool_->free_count();
+    return needed <= free || needed - free <= reclaimable_blocks();
+}
+
+void KVCacheManager::make_room(std::size_t needed, OpResult& result) {
+    while (pool_->free_count() < needed) {
+        // evict_one also re-checks the victim's parent, so a parent whose last
+        // child was just evicted is a candidate in the next round.
+        auto victim = evict_one(tree_, *policy_);
+        if (!victim) throw std::logic_error("ran out of evictable blocks after the capacity check");
+        result.evicted.push_back(*victim);
+        ++stats_.evictions;
+    }
+}
+
+OpResult KVCacheManager::reject(std::size_t needed) {
+    auto free = pool_->free_count();
+    return fail(Status::Reject, "needs " + std::to_string(needed) +
+                                    (needed == 1 ? " block, " : " blocks, ") +
+                                    std::to_string(free) + " free, " +
+                                    std::to_string(reclaimable_blocks()) + " evictable");
+}
+
 OpResult KVCacheManager::fail(Status status, const std::string& message) {
     if (status == Status::Reject) ++stats_.rejected;
     else ++stats_.errors;
@@ -125,16 +166,17 @@ OpResult KVCacheManager::admit(const RequestId& id, const std::vector<Token>& pr
     BlockTable table = BlockTable::from_prefix(*pool_, hit);
     const auto cached = table.token_count();
 
-    // TODO(integration): count evictable blocks as available capacity.
+    // Free blocks plus blocks eviction can free. The pins above already count:
+    // a matched block and its ancestors are not reclaimable for this request.
     auto needed = blocks_for(prompt.size()) - hit.size();
-    if (needed > pool_->free_count())
-        return fail(Status::Reject, "needs " + std::to_string(needed) + " blocks, " +
-                                        std::to_string(pool_->free_count()) + " free");
+    if (!has_room(needed)) return reject(needed);
 
     // The reused blocks were accessed, and the deepest one may have been an
     // evictable leaf until this request pinned it (the others have children).
     for (BlockId block : hit) policy_->on_access(block);
     if (!hit.empty()) policy_->set_evictable(hit.back(), false);
+    OpResult result;
+    make_room(needed, result);
 
     // The cached tokens are not written again, but they still advance the hash.
     auto hash = initial_prefix_hash(config_.seed);
@@ -143,7 +185,6 @@ OpResult KVCacheManager::admit(const RequestId& id, const std::vector<Token>& pr
         if (!table.append(next_payload(hash, prompt[i])))
             throw std::logic_error("admit ran out of blocks after its capacity check");
 
-    OpResult result;
     result.blocks = table.blocks();
     result.cached_tokens = cached;
     auto added = requests_.emplace(id, RequestState{prompt, hash, std::move(table)}).first;
@@ -167,9 +208,13 @@ OpResult KVCacheManager::append(const RequestId& id, Token token) {
     const auto& blocks = state.table.blocks();
     bool needs_block = blocks.empty() || pool_->full(blocks.back()) ||
                        pool_->references(blocks.back()) > 1;
-    // TODO(integration): evict one cached block here instead of rejecting.
-    if (needs_block && pool_->free_count() == 0)
-        return fail(Status::Reject, "needs 1 block, 0 free");
+    // One block is needed, so one evictable leaf is enough: no scan. The victim
+    // is held by no request, so it is never one of this request's blocks.
+    OpResult result;
+    if (needs_block && pool_->free_count() == 0) {
+        if (policy_->evictable_count() == 0) return reject(1);
+        make_room(1, result);
+    }
 
     auto copies_before = state.table.copy_count();
     auto hash = state.prefix_hash;
@@ -179,7 +224,6 @@ OpResult KVCacheManager::append(const RequestId& id, Token token) {
     state.tokens.push_back(token);
     if (state.tokens.size() % pool_->tokens_per_block() == 0) index_full_blocks(state);
 
-    OpResult result;
     result.blocks = state.table.blocks();
     result.cow_copies = state.table.copy_count() - copies_before;
     stats_.cow_copies += result.cow_copies;
@@ -200,11 +244,10 @@ OpResult KVCacheManager::fork(const RequestId& new_id, const RequestId& src_id) 
         // Share every block, including a partial tail. Needs no new blocks.
         table = source.table.fork();
     } else {
-        // Baseline: an independent copy, one fresh block per source block.
+        // Baseline: an independent copy, one fresh block per source block. The
+        // index is empty when sharing=off, so there is nothing to evict.
         auto needed = source.table.blocks().size();
-        if (needed > pool_->free_count())
-            return fail(Status::Reject, "needs " + std::to_string(needed) + " blocks, " +
-                                            std::to_string(pool_->free_count()) + " free");
+        if (needed > pool_->free_count()) return reject(needed);
         hash = initial_prefix_hash(config_.seed);
         for (Token token : source.tokens)
             if (!table.append(next_payload(hash, token)))

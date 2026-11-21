@@ -6,7 +6,7 @@
 // prints one result line per command, for example:
 //   ADMIT r1 -> OK blocks=[0,1] cached=0
 //   APPEND r2 -> OK blocks=[0,2] cow=1
-//   ADMIT r3 -> REJECT needs 3 blocks, 1 free
+//   ADMIT r3 -> REJECT needs 3 blocks, 1 free, 0 evictable
 // With --csv, the final statistics are also written as one CSV row.
 
 #include "kvcache/config.h"

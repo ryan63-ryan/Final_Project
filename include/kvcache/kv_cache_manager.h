@@ -47,12 +47,15 @@ struct Stats {
 // Facade over the storage module: maps request IDs to block tables and turns
 // trace operations into BlockPool / BlockTable calls.
 //
-// Every operation is all-or-nothing. Capacity is checked before anything is
-// changed, so Reject and Error leave the manager exactly as it was.
+// Every operation is all-or-nothing. Capacity (free plus reclaimable blocks) is
+// checked before anything is changed or evicted, so Reject and Error leave the
+// manager exactly as it was.
 //
 //   sharing=on   ADMIT reuses the longest cached run of full blocks found in the
 //                prefix index and writes only the rest; every block a request
 //                fills is indexed. FORK shares blocks and APPEND copies on write.
+//                When the free list is too short, cached blocks that no request
+//                holds are evicted in LRU or FIFO order, leaves first.
 //   sharing=off  baseline: the index is never used, ADMIT always allocates
 //                fresh blocks and FORK copies every token, so no block is ever
 //                shared.
@@ -99,6 +102,17 @@ private:
     // Puts every full block of `state` that the index does not cover yet into
     // the index and tells the policy. No-op when sharing=off.
     void index_full_blocks(const RequestState& state);
+    // Blocks that eviction could free right now: indexed blocks that no request
+    // holds and none of whose descendants a request holds. Counts parents that
+    // only become leaves once their children are evicted. O(capacity).
+    std::size_t reclaimable_blocks() const;
+    // True if `needed` blocks are free or can be freed. Runs the O(capacity)
+    // scan only when the free list alone is not enough.
+    bool has_room(std::size_t needed) const;
+    // Evicts in policy order until `needed` blocks are free and records the
+    // victims in `result`. Call only after has_room(needed) returned true.
+    void make_room(std::size_t needed, OpResult& result);
+    OpResult reject(std::size_t needed);
     OpResult fail(Status status, const std::string& message);
     void note_usage();
 
