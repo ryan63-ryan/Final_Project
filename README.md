@@ -19,8 +19,8 @@ The scope we agreed on is in the [proposal](EE538_Final_Project_Proposal.pdf).
 | Bowen Deng | `RadixTree`, LRU/FIFO eviction, radix compression |
 | Yingtao Yang | Config and trace parser, the driver, `KVCacheManager` integration, experiments. Integration lead |
 
-Things that are not finished yet are marked **TODO** in this file: `ReferenceCache`,
-the O(1) reclaimable count, the report PDF and the AI-use section.
+Things that are not finished yet are marked **TODO** in this file: the report PDF, the
+release tag and the AI-use section.
 
 ## Build
 
@@ -59,7 +59,7 @@ ctest --test-dir build-asan --output-on-failure
 ## Run
 
 ```
-kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check]
+kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check] [--sample-every <n>]
 ```
 
 - `--config` and `--trace` are required.
@@ -67,6 +67,9 @@ kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check]
   memory). The header is added if the file is empty.
 - `--no-check` turns off the invariant check that normally runs after every command. We
   use it for experiments. The check still runs once at the end.
+- `--sample-every <n>` reads the manager's statistics after every n-th command and adds
+  the average fragmentation to the CSV row. We only use it for the fragmentation run,
+  because it scans the pool between commands.
 
 The program prints one line per command. The exit code is 0 if everything worked and 1
 if a file can't be opened, a trace line is malformed, or an invariant fails. A bad trace
@@ -85,6 +88,7 @@ Unknown keys, repeated keys and bad values give an error with the line number.
 | `policy` | `lru` | `lru` or `fifo` |
 | `sharing` | `on` | `off` is the baseline where nothing is shared |
 | `seed` | 42 | seed for the fake payload bytes |
+| `reclaimable` | `count` | how ADMIT finds out how many blocks eviction could free: `count` asks the radix tree, which keeps the number up to date (O(1)); `scan` walks over all blocks (O(capacity)). Both give the same answer, so the output is the same |
 
 ### Trace file
 
@@ -154,7 +158,8 @@ make test          # unit tests + golden traces
 make sanitize      # same, with ASan + UBSan
 make gen-test      # trace generator tests (python3)
 make csv-test      # CSV output test (cmake)
-ctest --test-dir build --output-on-failure     # everything above, 13 tests
+make reference-test   # only the ReferenceCache comparison
+ctest --test-dir build --output-on-failure     # everything above, 14 tests
 python3 tests/demo_errors.py build-asan-make/block_demo    # 12 bad-input cases
 ```
 
@@ -163,20 +168,22 @@ What each test file covers:
 | File | What it checks |
 |---|---|
 | `tests/storage_tests.cpp` | Pool accounting, copy-on-write, ownership, running out of blocks, moves. 27,000 random steps compared with plain vectors. Heap order with 30,000 random steps compared with a linear scan |
-| `tests/radix_tests.cpp` | `match`, `insert`, `erase`, who owns which reference. Compressed edges: a match that ends in the middle of an edge, splits after the first block and after a middle block, split tails keep their children. 30,000 random steps compared with a `std::map` |
+| `tests/radix_tests.cpp` | `match`, `insert`, `erase`, who owns which reference. Compressed edges: a match that ends in the middle of an edge, splits after the first block and after a middle block, split tails keep their children. The reclaimable count with blocks held in the middle of an edge, splits, erases and moves. 30,000 random steps compared with a `std::map` |
 | `tests/radix_fault_tests.cpp` | Makes every allocation fail in turn during an edge extension, a new edge and two kinds of split, and checks nothing changed or leaked |
 | `tests/eviction_tests.cpp` | LRU vs FIFO order, blocks in use are never evicted, parent becomes evictable after its last child goes, evicting a compressed edge one block at a time. 36,000 random steps compared with a scan |
-| `tests/manager_tests.cpp` | The proposal example, fork and copy-on-write, a prefix-reuse trace and an LRU/FIFO eviction trace we calculated by hand, rejects that must not change anything, `sharing=off`, bad request IDs, and 24,000 random operations |
+| `tests/manager_tests.cpp` | The proposal example, fork and copy-on-write, a prefix-reuse trace and an LRU/FIFO eviction trace we calculated by hand, rejects that must not change anything, `sharing=off`, bad request IDs, fragmentation and duplicate blocks in `stats()`, and 24,000 random operations. Everything runs twice, with `reclaimable=count` and `scan`. Another 18,000 operations run on a count manager and a scan manager side by side and every result must be equal |
+| `tests/reference_tests.cpp`, `tests/reference_cache.*` | `ReferenceCache`: a second, simple implementation with vectors, maps and linear scans, no pool, radix tree or heap. It predicts every result (bytes, prefix hits, admit/reject, copy-on-write, evictions, all counters) and the test compares the real manager with it: hand traces plus 192 random sequences of 400 operations, in both `reclaimable` modes. See [docs/reference_tests.md](docs/reference_tests.md) |
 | `tests/golden/example.*` | proposal example through the driver |
-| `tests/golden/eviction*` | same eviction trace with LRU, FIFO and `sharing=off` |
+| `tests/golden/eviction*` | same eviction trace with LRU, FIFO and `sharing=off`. Each golden trace is also run with `reclaimable=scan` and must print the same output |
 | `tests/golden/fork_rejected.*` | commands of a rejected request and its forks are skipped |
 | `tests/golden/block_demo.*`, `tests/demo_errors.py` | storage demo and bad input |
-| `tests/check_csv.cmake` | `--csv` writes one header and one row per run |
+| `tests/check_csv.cmake` | `--csv` writes one header and one row per run; the `--sample-every` columns match values we worked out by hand |
 | `tests/gen_trace_test.py` | generated traces are valid, the same for the same seed, and run without errors |
 
 Every class has a `check_invariants()` function. The manager's version rebuilds every
 stored payload from the tokens and compares, and checks that each block's reference
-count equals the number of requests using it (plus one if it is in the index).
+count equals the number of requests using it (plus one if it is in the index). It also
+recounts the reclaimable blocks with the slow scan and compares with the tree's count.
 
 ## Experiments
 
@@ -189,16 +196,31 @@ bash scripts/run_experiments.sh --dry-run                             # just sho
 bash scripts/run_experiments.sh --quick --out results/raw/quick.csv   # 60 runs, a few seconds
 bash scripts/run_experiments.sh --out results/raw/full.csv            # 900 runs, about 35 min
 
+# the two extra runs we made
+bash scripts/run_experiments.sh --reclaimable scan --out results/raw/scan.csv
+bash scripts/run_experiments.sh --reps 1 --sample-every 64 --out results/raw/frag.csv
+
 # plots (needs matplotlib), reads results/raw/sweep*.csv
-python3 scripts/plot.py             # all workloads  -> results/figures/
-python3 scripts/plot.py --report    # report figures -> results/figures/report/
+python3 scripts/plot.py --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"
+python3 scripts/plot.py --report --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"
 ```
+
+The first plot command writes all workloads to `results/figures/`, the second writes the
+report figures to `results/figures/report/`. Without `--compare` the scan line is left
+out of the ADMIT latency figure.
 
 The sweep is sharing {off, on} x policy {LRU, FIFO} x capacity {256, 1024, 4096} x 5
 workloads x size {1k, 10k, 100k requests}, 5 repetitions each, with 16 tokens per block
-and 64 bytes per token. Our results are in `results/raw/sweep.csv` and
-`results/raw/sweep_skewed.csv`. The `.meta.txt` files next to them have the machine,
-compiler, flags and seeds.
+and 64 bytes per token. Our results are in `results/raw/`:
+
+| File | What |
+|---|---|
+| `sweep.csv` | the main sweep (`reclaimable=count`), 900 runs |
+| `scan_sweep.csv` | the same sweep with `reclaimable=scan`, from the same binary |
+| `fragmentation.csv` | one repetition with `--sample-every 64` |
+| `before_o1_count/` | our first sweeps, from before the O(1) count. Same counters, older latencies |
+
+The `.meta.txt` files next to them have the machine, compiler, flags and seeds.
 
 What we found (100k requests):
 
@@ -206,11 +228,19 @@ What we found (100k requests):
   sharing lets 99.9% of requests in, compared with 58.5% without sharing.
 - For multi-turn chats the hit rate depends a lot on capacity: 1.7%, 33.0%, 60.7% at
   256, 1024, 4096 blocks.
-- ADMIT is slower with sharing on (1.3x to 6.4x), and it gets worse with bigger
-  capacity. FORK is 6x to 14x faster.
+- ADMIT with sharing on takes 0.4x to 2.1x the time of sharing off (median). It is
+  about equal for the shared system prompt, faster when most requests are full cache
+  hits, and slowest for unique prompts, where sharing can't help. The p99 is always
+  higher with sharing (1.05x to 2.2x). FORK is 5x to 11x faster.
+- The O(1) reclaimable count matters: with the O(capacity) scan the ADMIT median was
+  1.1x to 5.0x higher and grew with capacity (for multi-turn at 4096 blocks, 21.4 us
+  against 4.3 us). Both versions make exactly the same decisions.
 - LRU and FIFO evict almost exactly the same blocks in most workloads. They only differ
   when a cached prefix gets reused without anything new being added under it. In that
   workload LRU's hit rate is 2 to 3 points higher.
+- Fragmentation is about 7.5 empty token slots per running request (half a block,
+  from its partial last block), which is 3% to 6% of what running requests store. It is
+  the same with sharing on and off.
 
 The full tables, the explanation for the LRU/FIFO result, and the exact commands to
 reproduce everything are in [docs/experiment_notes.md](docs/experiment_notes.md). Note
@@ -227,12 +257,12 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 |---|---|---|
 | Substantive custom work | Blocks are shared by requests, by forks and by the cache at the same time, and the pool has a fixed size. The pool, tables, index, policies and manager all have to agree on the reference counts | `src/`, `docs/integration_notes.md` |
 | Operational completeness | Full request lifecycle (ADMIT, APPEND, FORK, RELEASE), admission check, eviction with cascade, rejects that change nothing | `src/kv_cache_manager.cpp`, `src/main.cpp`, `tests/golden/` |
-| Inspectable design choice | No sharing vs prefix sharing, and LRU vs FIFO, on the same traces and capacity | `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sec. 4-5 |
+| Inspectable design choice | Three choices you can switch in the config and compare on the same traces and capacity: no sharing vs prefix sharing (`sharing`), LRU vs FIFO (`policy`), and O(capacity) scan vs O(1) incremental count for the reclaimable blocks (`reclaimable`). The last one changes no output, only time: the ADMIT median is 1.1x to 5.0x lower with the count | `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sec. 4-6, `results/figures/report/admit_latency_vs_capacity.png` |
 | Meaningful evaluation | 5 workloads, 3 capacities, 3 sizes. Includes cases where sharing is slower or useless | `docs/experiment_notes.md`, `results/` |
 | Feasible boundaries | Ours: everything in `src/` and `include/`. Reused: STL, Python/matplotlib for scripts. Not done on purpose: GPU, real model, threads, distributed | [Known limitations](#known-limitations), proposal sec. 3 |
 | I/O and state contract | Trace commands in, one result line out. Every command either fully happens or changes nothing | [Run](#run), `include/kvcache/kv_cache_manager.h` |
 | Driver on the real implementation | `kvcache` replays a trace on the actual manager and buffers | `src/main.cpp` |
-| Independent reference | Tests recompute each request's bytes from its tokens only. **TODO:** separate `ReferenceCache` class and a brute-force check of prefix hits | `tests/manager_tests.cpp` |
+| Independent reference | `ReferenceCache` is a separate simple implementation (vectors, maps, linear scans) that predicts bytes, prefix hits, capacity decisions and evictions; the real manager is compared with it step by step. The manager tests also recompute each request's bytes from its tokens only | `tests/reference_cache.*`, `tests/reference_tests.cpp`, `docs/reference_tests.md`, `tests/manager_tests.cpp` |
 | Documented harness instead of a model | Fake payload bytes from the token prefix, synthetic traces | `include/kvcache/kv_cache_manager.h`, `scripts/gen_trace.py` |
 
 ### KV-cache module contract (from the assignment's example)
@@ -245,7 +275,7 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Blocks in use are never evicted; defined failure when there's no room | Only unused leaf blocks can be evicted. ADMIT is rejected before anything changes | `eviction_capacity_tests`, `tests/eviction_tests.cpp` |
 | Prefix index: splits, inserts, removals | Edges hold runs of whole blocks. Inserting in the middle of an edge splits it at a block boundary, erase removes one block at a time. Lookup results are the same as with one node per block | `src/radix_tree.cpp` (`split_insert`, `extend`, `erase`), `tests/radix_tests.cpp`, `tests/radix_fault_tests.cpp`, `heal_tests` in `tests/manager_tests.cpp` |
 | Sharing off/on and LRU/FIFO on the same traces, with a "sharing is rare" workload and one under memory pressure | `unique` workload; capacity 256 | `scripts/run_experiments.sh`, `docs/experiment_notes.md` sec. 5 |
-| Report reuse, storage waste, latency, proxy definition | Hit rate, uncached tokens, latency per operation. **TODO:** fragmentation is saved in the CSVs (`fragmentation_slots`) but we haven't analyzed it | `docs/experiment_notes.md`, `results/raw/` |
+| Report reuse, storage waste, latency, proxy definition | Hit rate, uncached tokens, latency per operation. Storage waste: empty token slots in allocated blocks, sampled during the run, plus a count of blocks stored twice (none in our traces) | `docs/experiment_notes.md` sec. 5 and 7, `results/raw/fragmentation.csv`, `results/figures/report/fragmentation_vs_capacity.png` |
 
 ### C++
 
@@ -270,7 +300,7 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Data structure 3 | Block pool with free list and reference counts | `src/block_pool.cpp` |
 | Algorithm 1 | Longest-prefix match with edge splits | `RadixTree::match`, `split_insert` in `src/radix_tree.cpp` |
 | Algorithm 2 | Copy-on-write with reference counting | `BlockTable::append` in `src/block_table.cpp` |
-| Algorithm 3 | Greedy leaf eviction with cascade, plus counting how many blocks can be reclaimed | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_blocks`, `make_room` in `src/kv_cache_manager.cpp` |
+| Algorithm 3 | Greedy leaf eviction with cascade, plus counting how many blocks can be reclaimed. The count is kept incrementally in the tree (a block is "stuck" if it or something below it is in use, and changes are pushed up to the ancestors); the old full scan is kept as a check | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_count`, `refresh` in `src/radix_tree.cpp`; `reclaimable_blocks`, `make_room` in `src/kv_cache_manager.cpp` |
 | How they work together | One ADMIT uses all of them: the tree finds the prefix, reference counts tell which cached blocks are unused, the heap orders them, eviction removes leaves from the tree, and the freed blocks are written and indexed | `KVCacheManager::admit` |
 | Radix compression (proposal sec. 4) | An edge stores a run of full blocks and their tokens. Edges are extended, split and shortened only at block boundaries | `src/radix_tree.cpp`, `docs/radix_and_eviction.md` |
 
@@ -283,7 +313,7 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Invariants for each data structure | `check_invariants()` in pool, table, heap, tree, policies, manager | `src/*.cpp`, `include/kvcache/min_heap.h` |
 | Hard state transitions | Copy-on-write on a shared block, release with several holders, eviction of a block's ancestor, reject with a partial cache hit | `tests/manager_tests.cpp` |
 | Full input with expected output | 3 traces, 5 expected outputs | `tests/golden/` |
-| Independent reference | Vectors, linear scans and `std::map` in the unit tests; recomputed bytes in the manager tests. **TODO:** `ReferenceCache` | `tests/` |
+| Independent reference | Vectors, linear scans and `std::map` in the unit tests; recomputed bytes in the manager tests; `ReferenceCache` for the whole manager (76,800 random operations plus hand traces, each in both `reclaimable` modes) | `tests/`, `docs/reference_tests.md` |
 | Sanitizer | All tests pass with ASan + UBSan on Linux | `make sanitize` |
 | Known limitations | Listed below | [Known limitations](#known-limitations) |
 
@@ -292,15 +322,15 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Requirement | What we did | Where |
 |---|---|---|
 | Complexity with variables defined, worst/average/amortized | Table below | [Complexity](#complexity) |
-| Two approaches on the same inputs | Sharing off vs on, LRU vs FIFO | `docs/experiment_notes.md` sec. 4-5 |
+| Two approaches on the same inputs | Sharing off vs on, LRU vs FIFO, reclaimable scan vs count | `docs/experiment_notes.md` sec. 4-6 |
 | At least 3 sizes | 1k, 10k, 100k requests | `results/raw/sweep.csv` |
 | Repetitions, central value, variability | 5 runs each, median and interquartile range | `scripts/plot.py`, `docs/experiment_notes.md` sec. 2 |
 | Machine, flags, generator, seed | Saved with each sweep | `results/raw/*.meta.txt` |
 | Separate preprocessing from operation time | Only the manager call is timed. Parsing and printing are counted separately as driver time | `src/main.cpp` |
 | Time and memory | Median, p99, mean per operation. Memory is the peak RSS of the whole process (measured, includes the pool, the index and the driver) | `docs/experiment_notes.md` sec. 5.2 |
 | At least 2 factors besides size | Workload (how much prefix sharing) and capacity (memory pressure) | `docs/experiment_notes.md` sec. 2-3 |
-| Module boundary, driver overhead, proxy metrics | Operation time vs total driver time. Uncached tokens are labeled as a proxy | `docs/experiment_notes.md` sec. 1, 2, 6 |
-| Raw data and reproduce commands | CSV row per run, scripts for traces and plots | `results/raw/`, `scripts/`, `docs/experiment_notes.md` sec. 8 |
+| Module boundary, driver overhead, proxy metrics | Operation time vs total driver time. Uncached tokens are labeled as a proxy | `docs/experiment_notes.md` sec. 1, 2, 8 |
+| Raw data and reproduce commands | CSV row per run, scripts for traces and plots | `results/raw/`, `scripts/`, `docs/experiment_notes.md` sec. 10 |
 
 ### Submission
 
@@ -358,22 +388,27 @@ E = evictable blocks.
 | `MinHeap` push/pop/update/erase | O(log E) | key lookup is a hash map, expected O(1) |
 | `RadixTree::match`, `insert` (k blocks over e edges, e <= k) | O(k B + e B log F) | extending an edge is amortized O(B); a split also copies the s tail blocks and moves its c children: O(s B + c) |
 | `RadixTree::erase`, `contains`, `is_leaf`, `parent` | expected O(1) | hash map; erase is amortized |
+| `RadixTree::reclaimable_count` | O(1) | |
+| `RadixTree::refresh` | O(1) amortized per block, O(depth) worst case | walks up only while an ancestor's state changes; pinning and later releasing a path of k blocks costs O(k) in total |
 | Policy `on_insert`/`on_access`/`on_erase`/`set_evictable` | O(log E) | `victim` is O(1) |
-| `admit` | O(k B + e B log F) + O((T - kB) P) + O(log E) per eviction | plus O(C) when the free list isn't enough (see below) |
+| `admit` | O(k B + e B log F) + O((T - kB) P) + O(log E) per eviction | with `reclaimable=scan`, plus O(C) when the free list isn't enough |
 | `append` | O(P) amortized, O(B P) with copy-on-write | plus O(L B log F) when the block fills up and gets indexed |
-| `fork` | O(L) with sharing, O(T P) without | the baseline copies everything |
-| `release` | O(L log E) | |
-| `stats` | O(C) | scans for fragmentation |
+| `fork` | O(L) with sharing, O(T P) without | the baseline copies everything; with sharing each block is also refreshed in the tree |
+| `release` | O(L log E) | plus one `refresh` per block |
+| `stats` | O(C) | scans for fragmentation and duplicate blocks |
 
 Unless marked, these are worst case. "Expected" ones go through a hash map and can be
 worse with bad collisions. Space is O(C B P) for payload, O(N B) tokens and at most N
 tree nodes for N indexed blocks, and O(T) tokens per live request.
 
-**TODO (O(1) reclaimable count):** when the free list is too short, `admit` scans all
-blocks to count what could be evicted. We think this is why ADMIT gets slower with
-larger capacity. The plan is to keep that count inside the tree instead; the spec is in
-[docs/bowen_reclaimable_count.md](docs/bowen_reclaimable_count.md). We will rerun the
-experiments after that.
+**Reclaimable count.** When the free list is too short, `admit` has to know how many
+blocks eviction could free before it changes anything. Our first version scanned all
+blocks for that, and ADMIT got slower as the capacity grew. Bowen then made the tree
+keep the count itself ([docs/bowen_reclaimable_count.md](docs/bowen_reclaimable_count.md)
+is the spec we wrote for it), and the manager calls `refresh` whenever a request starts
+or stops using a block. The scan is still there as `reclaimable=scan`, so the two can
+be compared, and the invariant check uses it to verify the count. Results are in
+[docs/experiment_notes.md](docs/experiment_notes.md), section 6.
 
 ## Known limitations
 
@@ -384,12 +419,15 @@ experiments after that.
   left with a single child, so the tree is not always fully compressed. This only
   affects the node count, not results. (Merging would need to allocate inside `erase`,
   and eviction relies on `erase` not throwing.)
-- No separate `ReferenceCache` class yet (TODO).
-- ADMIT gets slower as capacity grows when sharing is on (TODO above).
+- For unique prompts the ADMIT median still grows with capacity when sharing is on
+  (5.5 us at 256 blocks, 10.3 us at 4096), even with the O(1) count. We haven't found
+  out why.
+- With `sharing=off` the manager can't tell that two requests store the same prefix,
+  so `duplicate_blocks` is always 0 there.
 - Single-threaded only. No GPU, no real model, no distributed serving.
 - Payloads are fake, so the latencies only measure our bookkeeping.
 - Experiments ran on one machine with one trace seed. More in
-  [docs/experiment_notes.md](docs/experiment_notes.md), section 6.
+  [docs/experiment_notes.md](docs/experiment_notes.md), section 8.
 
 ## AI use
 
@@ -410,13 +448,14 @@ src/                 .cpp files and the driver (main.cpp)
 examples/            block_demo.cpp, a small storage demo
 tests/               unit tests, test scripts, golden/ traces
 scripts/             gen_trace.py, run_experiments.sh, plot.py
-results/raw/         sweep CSVs and .meta.txt
+results/raw/         sweep CSVs and .meta.txt (before_o1_count/ has the first sweeps)
 results/figures/     plots (report/ has the ones for the report)
 docs/
   storage_module.md            storage details (Bohan)
   radix_and_eviction.md        radix and eviction details (Bowen)
   integration_notes.md         integration notes and hand-worked traces
   experiment_notes.md          experiment results and how to reproduce
+  reference_tests.md           what the ReferenceCache tests cover (Bohan)
   bowen_reclaimable_count.md   spec for the O(1) count
 Makefile, CMakeLists.txt
 EE538_Final_Project_Proposal.pdf
