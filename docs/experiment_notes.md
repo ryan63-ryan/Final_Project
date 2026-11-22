@@ -17,25 +17,25 @@ counters are identical to the current ones; only latencies changed.
 
 ## 1. Summary
 
-- **Sharing pays off in tokens and in admission, and costs little in ADMIT latency.**
-  With a shared system prefix, 66% of prompt tokens come from the cache, and at
-  capacity 256 the manager admits 99.9% of requests instead of 58.5%. The ADMIT median
-  with sharing on is 0.4 to 2.1 times the sharing-off median: equal for the shared
-  system prefix, faster when most requests are full cache hits, slower otherwise
-  (section 5.2).
-- **The O(1) reclaimable count removed most of the cost of sharing.** With the earlier
-  O(capacity) scan the ADMIT median was 1.1 to 5.0 times higher and grew with capacity;
-  both variants were measured from one build and make identical decisions (section 6).
-- **LRU and FIFO make the same decisions on four of the five workloads.** They differ
-  only in `skewed_short`, where LRU has a 2-3 percentage point higher hit rate
-  (section 4).
-- **Unique prompts show the cost of sharing with no benefit:** 0% hits, the same
-  admission rate, and ADMIT 1.6-2.1 times slower.
-- **Fragmentation is small and comes from partial last blocks:** about 7.5
-  empty token slots per running request (3-6% of the storage running requests hold),
-  the same with sharing on or off, and no block was stored twice (section 7).
-- Token counts are a proxy for recomputation. They do not establish a model-serving
-  speedup: a real system spends far more time computing a token's KV entries than this
+- Sharing helps a lot with tokens and admission. With a shared system prefix, 66% of
+  prompt tokens come from the cache, and at capacity 256 the manager admits 99.9% of
+  requests instead of 58.5%.
+- It does not cost much in ADMIT latency any more. The ADMIT median with sharing on is
+  0.4 to 2.1 times the sharing-off median: about equal for the shared system prefix,
+  faster when most requests are full cache hits, slower otherwise (section 5.2).
+- Most of the cost we saw at first came from the O(capacity) reclaimable scan. With the
+  scan the ADMIT median was 1.1 to 5.0 times higher than with the O(1) count, and it
+  grew with capacity. We measured both from one build, and they make exactly the same
+  decisions (section 6).
+- LRU and FIFO make the same decisions on four of the five workloads. They differ only
+  in `skewed_short`, where LRU has a 2-3 percentage point higher hit rate (section 4).
+- Unique prompts are the bad case for sharing: 0% hits, the same admission rate, and
+  ADMIT 1.6-2.1 times slower.
+- Fragmentation is small. It is about 7.5 empty token slots per running request (3-6%
+  of what running requests store), it comes from partial last blocks, and it is the
+  same with sharing on or off. No block was stored twice (section 7).
+- Token counts are only a proxy for recomputation. We are not claiming a model-serving
+  speedup: a real system spends far more time computing a token's KV entries than our
   manager spends storing fake payload bytes.
 
 ## 2. Setup
@@ -58,18 +58,18 @@ next to each CSV.
 
 How the numbers are measured:
 
-- **Latency** is the time of the manager call alone (`std::chrono::steady_clock`
+- Latency is the time of the manager call alone (`std::chrono::steady_clock`
   around `admit`, `append`, `fork` or `release`). Parsing, invariant checks and printing
   are outside. Rejected calls are timed too.
 - Each run reports the median, 99th percentile and mean per operation type from a
   constant-memory histogram (percentiles within 0.8% of the true sample). The tables
   below give the median over the repetitions of the per-run value.
-- **Counters** (hits, evictions, admitted, blocks) are deterministic: all repetitions of
+- Counters (hits, evictions, admitted, blocks) are deterministic: all repetitions of
   a configuration agree, and `plot.py` refuses to plot if they do not.
 - With sharing off the prefix index is never used, so the policy cannot matter. The LRU
   and FIFO runs with sharing off have identical counters and are pooled (10
   repetitions).
-- **Peak RSS** is `getrusage` `ru_maxrss` for the whole driver process.
+- Peak RSS is `getrusage` `ru_maxrss` for the whole driver process.
 - APPEND medians are 80-100 ns, which is at the resolution of the clock; differences
   between configurations there are not meaningful.
 
@@ -243,8 +243,8 @@ which protects them under either policy.
 
 ### 4.4 What this means for the report
 
-The answer to "how do LRU and FIFO handle pressure" is workload-dependent in a specific
-way: with leaf-only eviction, the policies differ only when cached blocks are reused
+So how LRU and FIFO handle pressure depends on the workload, in one specific way: with
+leaf-only eviction, the policies differ only when cached blocks are reused
 *without being extended*. Workloads where every request extends what it reuses
 (system prompt plus a long unique turn, multi-turn chat) make the policy choice
 irrelevant. Workloads with many requests that reuse a prefix and add little
@@ -276,19 +276,19 @@ irrelevant. Workloads with many requests that reuse a prefix and add little
 
 Findings:
 
-- **Shared system prefix:** 66.4% of prompt tokens are cached at every capacity. The 4
+- Shared system prefix: 66.4% of prompt tokens are cached at every capacity. The 4
   prompts need only 32 blocks and are always in use, so capacity does not matter. At
   capacity 256, sharing admits 99.9% of ADMITs against 58.5%: requests that share 8
   blocks need fewer blocks of their own.
-- **Multi-turn:** the hit rate depends strongly on capacity: 1.7% at 256, 33.0% at
+- Multi-turn: the hit rate depends strongly on capacity: 1.7% at 256, 33.0% at
   1,024, 60.7% at 4,096. A conversation's blocks must survive in the cache until its
   next turn; at 256 blocks the running requests alone fill the pool and nearly
   everything is evicted first.
-- **Unique prompts:** no hits and no admission benefit. Sharing only adds work: about
+- Unique prompts: no hits and no admission benefit. Sharing only adds work: about
   10 evictions per ADMIT, because every block a request fills is cached and later
   evicted without ever being reused.
-- **Skewed:** between the two: 26-46% hits, and 67.3% against 58.6% admission at 256.
-- **Peak blocks:** with sharing on the pool always fills to capacity, because cached
+- Skewed: between the two: 26-46% hits, and 67.3% against 58.6% admission at 256.
+- Peak blocks: with sharing on the pool always fills to capacity, because cached
   blocks stay allocated until evicted. Sharing off shows the live demand (165-500
   blocks).
 - At capacity 256 the uncached-token columns are not comparable between on and off
@@ -322,8 +322,8 @@ nanoseconds.
 
 Findings:
 
-- **ADMIT with sharing on is at most 2.1 times slower than off, and sometimes
-  faster.** The on / off ratio of the median is:
+- ADMIT with sharing on is at most 2.1 times slower than off, and sometimes
+  faster. The on / off ratio of the median is:
   - `system`: 0.9-1.0, the same within noise. The prefix lookup and the eviction
     bookkeeping cost about as much as writing the 128 tokens they save.
   - `multiturn`: 1.7 at capacity 256 (1.7% hits, so sharing only adds work) and 1.2 at
@@ -332,21 +332,21 @@ Findings:
   - `unique`: 1.6-2.1, the worst case: no hits, and every ADMIT evicts about 10 blocks.
   - `skewed_short`: 1.6 at 256, but 0.5 at 1,024 and 0.4 at 4,096 (2.2 and 1.8 us
     against 4.1 us). Most requests there are full cache hits that write a few tokens.
-- **The ADMIT p99 is higher with sharing on everywhere:** 1.05 to 2.2 times the
+- The ADMIT p99 is higher with sharing on everywhere: 1.05 to 2.2 times the
   sharing-off p99. The slow ADMITs are the ones that evict many blocks.
-- **The ADMIT median no longer grows with capacity** except for `unique` (5.5 to
+- The ADMIT median no longer grows with capacity except for `unique` (5.5 to
   10.3 us) and slightly for `system` (5.0 to 6.6 us). In the earlier measurement it
   grew 2.6-3.1 times from 256 to 4,096 blocks because of the reclaimable scan
   (section 6).
-- **FORK is 5-11 times faster with sharing** (0.6-0.8 us against 3-7 us): sharing
+- FORK is 5-11 times faster with sharing (0.6-0.8 us against 3-7 us): sharing
   retains the source's blocks, the baseline copies every token.
-- **RELEASE is 1.6-3.0 times slower with sharing** (0.4-0.9 us against 0.2-0.4 us):
+- RELEASE is 1.6-3.0 times slower with sharing (0.4-0.9 us against 0.2-0.4 us):
   each released block is reported to the index and the policy. APPEND is the same
   within clock resolution.
-- **Total time in manager operations** is 1.1 to 1.9 times higher with sharing on in
+- Total time in manager operations is 1.1 to 1.9 times higher with sharing on in
   14 of the 15 configurations, and lower in one (`skewed_short` at 4,096: 0.47 s
   against 0.52 s).
-- **Peak RSS** is 4-10 MB for the whole driver and grows with capacity (4,096 blocks
+- Peak RSS is 4-10 MB for the whole driver and grows with capacity (4,096 blocks
   are 4 MiB of payload). Sharing adds at most 1.3 MB for the index and policy.
 
 ### 5.3 Trace size
@@ -371,16 +371,16 @@ manager can get that number in two ways, chosen by the config key `reclaimable`:
 
 ### 6.1 Validity
 
-- **Same build.** Both sweeps ran one after the other from the same binary (commit
+- Same build. Both sweeps ran one after the other from the same binary (commit
   `b58a5d9`); its checksum was identical before the first, between the two and after
   the second. Only the config key differs.
-- **Identical decisions.** All 180 configurations have the same counters (admitted,
+- Identical decisions. All 180 configurations have the same counters (admitted,
   rejected, hits, uncached tokens, copies, evictions, peak blocks) in both sweeps, and
   the same as the earlier sweeps in `before_o1_count/`.
-- **Checked in the tests too.** `check_invariants()` compares the count with the scan
+- Checked in the tests too. `check_invariants()` compares the count with the scan
   after every operation in both modes, and the golden traces must print the same
   output in both.
-- **What "scan" measures.** The `refresh` calls run in both modes, because the
+- What "scan" measures. The `refresh` calls run in both modes, because the
   invariant needs the count to be correct in scan mode as well. So the scan sweep is
   the scan plus that bookkeeping. Its ADMIT medians are within 6% of the earlier,
   scan-only sweep, so the bookkeeping is small next to the scan.
@@ -411,26 +411,26 @@ agree within 3% on its median). FIFO is within a few percent of LRU in both mode
 
 Findings:
 
-- **The scan was the cause of the growth with capacity.** From 256 to 4,096 blocks the
+- The scan was the cause of the growth with capacity. From 256 to 4,096 blocks the
   scan median grows 2.6-3.1 times on the first four workloads. With the count it is
   flat for `multiturn` (4.7 to 4.3 us) and grows 1.3 times for `system` and `skewed`.
-  The earlier version of these notes only inferred this from the shape of the curve;
-  this is the direct comparison.
-- **The count is faster in every configuration:** 1.1 to 5.0 times on the median and
+  In the first version of these notes we only guessed this from the shape of the curve.
+  Now we have the direct comparison.
+- The count is faster in every configuration: 1.1 to 5.0 times on the median and
   1.1 to 4.9 times on the p99. The gain is largest at capacity 4,096, where the scan
   is longest.
-- **`unique` still grows with capacity under the count** (5.5, 8.5, 10.3 us). The scan
-  is gone, so this is something else; it has not been measured. One candidate is that
+- `unique` still grows with capacity under the count (5.5, 8.5, 10.3 us). The scan
+  is gone, so it must be something else. We have not measured what. Our guess is that
   a larger pool holds a larger index, so the evictions an ADMIT makes touch more
   memory.
-- **Is ADMIT with sharing on still slower than off?** For the median: no longer in
+- Is ADMIT with sharing on still slower than off? For the median: no longer in
   general. It is equal for `system` (0.9-1.0), 1.2-1.3 times slower for `skewed` and
   for `multiturn` above capacity 256, 1.6-2.1 times slower for `unique` and, at
   capacity 256, for `multiturn` and `skewed_short`, and about twice as fast for
   `skewed_short` at 1,024 and 4,096. With the scan it was slower in 14 of 15
   configurations, by up to 5.8 times. For the p99: yes, still slower everywhere, by 1.05
   to 2.2 times.
-- **Total time in manager operations** with sharing on fell from 0.75-3.73 s (scan)
+- Total time in manager operations with sharing on fell from 0.75-3.73 s (scan)
   to 0.47-1.79 s (count) per 100k-request trace.
 
 ### 6.3 Cost on the other operations
@@ -438,16 +438,16 @@ Findings:
 The `refresh` calls are not free. Compared with the sweep made before they existed,
 with sharing on:
 
-- **FORK** median went from about 0.50 to about 0.65 us: a fork now reports every
+- FORK median went from about 0.50 to about 0.65 us: a fork now reports every
   shared block to the tree.
-- **RELEASE** median went from 0.37-0.57 to 0.52-0.91 us on the first four workloads
+- RELEASE median went from 0.37-0.57 to 0.52-0.91 us on the first four workloads
   (0.28-0.31 to 0.38-0.41 us on `skewed_short`), for the same reason. In the count
   sweep it is up to 14% higher than in the scan sweep although the code path is the
-  same; this has not been explained.
-- **APPEND** is unchanged (about 90 ns).
+  same. We don't know why.
+- APPEND is unchanged (about 90 ns).
 
 A request does one RELEASE and at most one FORK, each about 0.15-0.35 us slower, and
-its ADMIT is up to 17 us faster, so the trade is worth it; the totals above include all operations.
+its ADMIT is up to 17 us faster, so we think it is worth it; the totals above include all operations.
 
 ## 7. Fragmentation (storage waste)
 
@@ -456,7 +456,7 @@ its ADMIT is up to 17 us faster, so the trade is worth it; the totals above incl
 `fragmentation_slots` counts token slots that are allocated but empty: for every
 allocated block, 16 minus the tokens stored in it. The column of that name in the
 sweep CSVs is read once at the end of the trace, when every request has been released,
-so it is 0 in every row and says nothing. For this section the driver was run with
+so it is 0 in every row and tells us nothing. For this section we ran the driver with
 `--sample-every 64`: after every 64th operation it reads the manager's statistics
 (outside the timed region) and reports the mean and the largest sample. That is 9,376
 to 59,557 samples per 100k-request trace. The run is separate
@@ -493,50 +493,50 @@ running request.
 
 Findings:
 
-- **Fragmentation is about 7.5 empty slots per running request, whatever the workload,
-  capacity, sharing mode or policy** (7.2 to 7.5). That is what one partial last block
+- Fragmentation is about 7.5 empty slots per running request, whatever the workload,
+  capacity, sharing mode or policy (7.2 to 7.5). That is what one partial last block
   per request gives: its fill is anywhere from 1 to 16 tokens, so on average
   (16 - 1) / 2 = 7.5 slots are empty.
-- **It follows the number of running requests, not the capacity.** With 31.6 requests
+- It follows the number of running requests, not the capacity. With 31.6 requests
   running on average it is 237 slots, about 15 blocks' worth. It is lower only where
   fewer requests run: at capacity 256, where requests are rejected, and in
   `skewed_short`, whose requests are short-lived (2.1 running on average).
-- **Sharing changes it only through admission.** Where both modes admit every request,
+- Sharing changes it only through admission. Where both modes admit every request,
   on and off agree within 0.1 slot. At capacity 256 sharing admits more requests
   (`system`: 31.6 running against 18.4), so it also has more partial tails: 237 slots
   against 132. That is more waste in absolute terms but for more work done.
-- **As a share of storage it is 3.3-5.5%** of the slots held by running requests.
+- As a share of storage it is 3.3-5.5% of the slots held by running requests.
   With sharing on the pool is kept full of cached blocks, which are all full, so the
   share of the whole pool is 0.4% at capacity 4,096.
-- **No duplicate block was sampled in any of the 180 runs.**
+- No duplicate block was sampled in any of the 180 runs.
 
 `fragmentation_vs_capacity.png` shows the mean empty slots by capacity.
 
 ### 7.3 Where the waste comes from
 
-- **Partial tail blocks.** Blocks are allocated whole, and a request's last block is
+- Partial tail blocks. Blocks are allocated whole, and a request's last block is
   usually not full. This is the only source that shows up in the numbers above, and
   it is internal fragmentation in the usual sense. There is no external fragmentation:
   all blocks have the same size and any free block can serve any request.
-- **Copy-on-write copies.** A fork shares its source's partial tail, so right after a
+- Copy-on-write copies. A fork shares its source's partial tail, so right after a
   fork the two requests have one partial block between them, not two. The first
   APPEND to either copies the tail, and from then on each has its own. So
   copy-on-write does not add waste beyond "one partial tail per request"; sharing
   only delays it. With sharing off the fork copies everything at once. Forks are 2%
   of requests (923 to 1,866 copies per 100k-request trace), which is why on and off
   differ by at most 0.1 slot.
-- **Private duplicates.** Only full blocks are indexed, and only the first block for a
+- Private duplicates. Only full blocks are indexed, and only the first block for a
   given prefix. If a second request fills a block with the same prefix, for example
   two forks of one request that generate the same tokens, its block stays private and
   the content is stored twice until that request is released. The unit test
   `waste_tests` in `tests/manager_tests.cpp` builds this case. In the generated
   traces appended tokens are random, so it did not occur once.
-- **Not counted here:** with sharing off, every request stores its own copy of a
+- Not counted here: with sharing off, every request stores its own copy of a
   prefix it shares with others (the 128-token system prompt is stored once per running
   request). That duplication is what sharing removes; it shows up as uncached tokens
   and peak blocks in section 5.1, not as fragmentation. The manager cannot detect it
   with sharing off, so `duplicate_blocks` is 0 there by definition.
-- **The partial tail is also never shared through the index:** two requests with the
+- The partial tail is also never shared through the index: two requests with the
   same 20-token prompt share the first 16 tokens and each write the last 4. This costs
   recomputation (uncached tokens), not empty slots.
 
@@ -546,32 +546,32 @@ B = 16 was measured.
 
 ## 8. Limitations
 
-- **Rejected APPENDs do not end their request.** At capacity 256, 1-4% of executed
+- Rejected APPENDs do not end their request. At capacity 256, 1-4% of executed
   APPENDs are rejected and the request continues without that token. See
   `docs/integration_notes.md` section 7.1. Capacities 1,024 and 4,096 are not
   affected.
-- **One machine, one trace seed.** Each configuration was repeated five times on the
+- One machine, one trace seed. Each configuration was repeated five times on the
   same trace; the repetitions measure timing noise, not variation between traces.
-- **Timing under WSL2** with traces read from a Windows drive. Only the manager calls
+- Timing under WSL2 with traces read from a Windows drive. Only the manager calls
   are timed, so file access does not enter the operation latencies, but it dominates
   the total driver time.
-- **The clock costs about as much as an APPEND.** Two `steady_clock` readings bracket
+- The clock costs about as much as an APPEND. Two `steady_clock` readings bracket
   every operation; for operations under 100 ns the reported time is mostly that.
-- **No profiler was used.** The scan's cost is established by the scan / count
-  comparison in section 6, but the remaining growth of the `unique` ADMIT median with
-  capacity and the slower RELEASE in the count sweep are unexplained.
-- **Fragmentation is sampled** every 64 operations in a separate run (section 7), not
+- No profiler was used. The scan's cost is established by the scan / count
+  comparison in section 6, but we can't explain why the `unique` ADMIT median still
+  grows with capacity or why RELEASE is slower in the count sweep.
+- Fragmentation is sampled every 64 operations in a separate run (section 7), not
   tracked exactly; the "largest" value is the largest sample.
-- **Fake payloads.** Stored bytes are derived from token prefixes; no model runs.
+- Fake payloads. Stored bytes are derived from token prefixes; no model runs.
   Latencies are those of the bookkeeping only.
 
 ## 9. Figures
 
 `scripts/plot.py` writes two sets from the same data:
 
-- **Report set**, `results/figures/report/` (`plot.py --report`): 7 inches wide for a
+- Report set, `results/figures/report/` (`plot.py --report`): 7 inches wide for a
   single-column report, with three panels: `system`, `multiturn` and `skewed_short`.
-- **Appendix set**, `results/figures/` (`plot.py`): one panel per workload, all five.
+- Appendix set, `results/figures/` (`plot.py`): one panel per workload, all five.
 
 Unless noted, a figure has one panel per workload and three series: sharing on with
 LRU, sharing on with FIFO, and sharing off. The capacity figures use the 100k traces.
@@ -611,9 +611,9 @@ bash scripts/run_experiments.sh --reps 1 --sample-every 64 \
 # 3. Figures. Needs matplotlib.
 python3 -m pip install matplotlib      # or: sudo apt install python3-matplotlib
 python3 scripts/plot.py \
-    --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"   # -> results/figures/
+    --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"   # -> results/figures/
 python3 scripts/plot.py --report \
-    --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"   # -> results/figures/report/
+    --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"   # -> results/figures/report/
 ```
 
 `plot.py` pools every `results/raw/sweep*.csv`, so the scan sweep and the sampled run
