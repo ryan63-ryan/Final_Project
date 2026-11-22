@@ -154,7 +154,7 @@ make test          # unit tests + golden traces
 make sanitize      # same, with ASan + UBSan
 make gen-test      # trace generator tests (python3)
 make csv-test      # CSV output test (cmake)
-ctest --test-dir build --output-on-failure     # everything above, 12 tests
+ctest --test-dir build --output-on-failure     # everything above, 13 tests
 python3 tests/demo_errors.py build-asan-make/block_demo    # 12 bad-input cases
 ```
 
@@ -185,9 +185,9 @@ count equals the number of requests using it (plus one if it is in the index).
 python3 scripts/gen_trace.py --mode system --requests 1000 --seed 1 --out traces/system_1k.trace
 
 # run the sweep
-scripts/run_experiments.sh --dry-run                             # just show the plan and time estimate
-scripts/run_experiments.sh --quick --out results/raw/quick.csv   # 60 runs, a few seconds
-scripts/run_experiments.sh --out results/raw/full.csv            # 900 runs, about 35 min
+bash scripts/run_experiments.sh --dry-run                             # just show the plan and time estimate
+bash scripts/run_experiments.sh --quick --out results/raw/quick.csv   # 60 runs, a few seconds
+bash scripts/run_experiments.sh --out results/raw/full.csv            # 900 runs, about 35 min
 
 # plots (needs matplotlib), reads results/raw/sweep*.csv
 python3 scripts/plot.py             # all workloads  -> results/figures/
