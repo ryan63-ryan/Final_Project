@@ -4,7 +4,7 @@
   python3 scripts/plot.py              # appendix figures -> results/figures/
   python3 scripts/plot.py --report     # report figures   -> results/figures/report/
   python3 scripts/plot.py --csv a.csv b.csv --out some/dir --size 10k --capacity 1024
-  python3 scripts/plot.py --compare "Sharing on, O(1) count=results/raw/o1_sweep.csv"
+  python3 scripts/plot.py --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"
 
 Rows from all --csv files are pooled (default: results/raw/sweep*.csv).
 
@@ -36,10 +36,11 @@ one value is drawn. Latency differs between repetitions: a point is the median
 over the repetitions of the per-run value and its bar spans their interquartile
 range.
 
---compare LABEL=FILE adds a later sweep of the same traces, made with a changed
-build, to admit_latency_vs_capacity.png as one more series (its sharing-on LRU
-rows). Its rows are kept apart from the pooled ones, and the file is left out of
-the default results/raw/sweep*.csv pool. Give the option once per build.
+--compare LABEL=FILE adds another sweep of the same traces, made with a different
+setting or build (for example reclaimable=scan), to admit_latency_vs_capacity.png
+as one more series (its sharing-on LRU rows). Its rows are kept apart from the
+pooled ones, and the file is left out of the default results/raw/sweep*.csv pool.
+Give the option once per sweep.
 
 Needs matplotlib. The CSVs are read with the standard library.
 """
@@ -308,6 +309,10 @@ def admit_latency_figure(plt, layout, groups, compare, capacities, size, path):
     note = ("Time of the admit call alone, %s-request traces. Point: median over the "
             "repetitions of each run's median (top) or 99th percentile (bottom). Bar: "
             "interquartile range over the repetitions. Sharing on is shown for LRU only." % size)
+    kinds = {row.get("reclaimable") for rows in groups.values() for row in rows}
+    if compare and len(kinds) == 1 and None not in kinds:
+        note += (" Series that do not name a setting were run with reclaimable=%s."
+                 % kinds.pop())
     fig = Figure(plt, layout, 2, len(modes), note, len(drawn), "row")
     positions = list(range(len(capacities)))
     rows = [("admit_median_ns", "ADMIT median (µs)"), ("admit_p99_ns", "ADMIT p99 (µs)")]
@@ -442,7 +447,7 @@ def main():
                              "panels only")
     parser.add_argument("--compare", action="append", default=[], metavar="LABEL=FILE",
                         help="overlay a later sweep in admit_latency_vs_capacity.png, e.g. "
-                             "\"Sharing on, O(1) count=results/raw/o1_sweep.csv\"")
+                             "\"Sharing on, LRU, scan=results/raw/scan_sweep.csv\"")
     parser.add_argument("--size", default=None,
                         help="trace size for the capacity figures (default: largest in the CSV)")
     parser.add_argument("--capacity", type=int, default=None,
