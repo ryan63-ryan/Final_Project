@@ -102,6 +102,11 @@ private:
     // Puts every full block of `state` that the index does not cover yet into
     // the index and tells the policy. No-op when sharing=off.
     void index_full_blocks(const RequestState& state);
+    // RadixTree cannot see the pool, so after a request retains or releases
+    // blocks the manager reports each one: the tree re-reads its reference
+    // count and updates reclaimable_count(). Blocks that are not indexed are
+    // ignored by the tree. No-op when sharing=off (the index is empty).
+    void refresh_blocks(const std::vector<BlockId>& blocks);
     // Blocks that eviction could free right now: indexed blocks that no request
     // holds and none of whose descendants a request holds. Counts parents that
     // only become leaves once their children are evicted. O(capacity).

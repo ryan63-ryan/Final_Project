@@ -99,6 +99,11 @@ void KVCacheManager::index_full_blocks(const RequestState& state) {
     }
 }
 
+void KVCacheManager::refresh_blocks(const std::vector<BlockId>& blocks) {
+    if (!config_.sharing) return;
+    for (BlockId block : blocks) tree_.refresh(block);
+}
+
 std::size_t KVCacheManager::reclaimable_blocks() const {
     // A block is stuck if a request holds it or any block below it: leaves go
     // first, so it can never become an evictable leaf. Mark every held indexed
@@ -124,7 +129,9 @@ bool KVCacheManager::has_room(std::size_t needed) const {
 void KVCacheManager::make_room(std::size_t needed, OpResult& result) {
     while (pool_->free_count() < needed) {
         // evict_one also re-checks the victim's parent, so a parent whose last
-        // child was just evicted is a candidate in the next round.
+        // child was just evicted is a candidate in the next round. RadixTree::erase
+        // updates reclaimable_count() itself: the only reference that changes is
+        // the index's own, on a block that leaves the index, so no refresh is due.
         auto victim = evict_one(tree_, *policy_);
         if (!victim) throw std::logic_error("ran out of evictable blocks after the capacity check");
         result.evicted.push_back(*victim);
@@ -164,12 +171,18 @@ OpResult KVCacheManager::admit(const RequestId& id, const std::vector<Token>& pr
     std::vector<BlockId> hit;
     if (config_.sharing) hit = tree_.match(prompt);
     BlockTable table = BlockTable::from_prefix(*pool_, hit);
+    refresh_blocks(hit); // retained: the matched blocks are now held
     const auto cached = table.token_count();
 
     // Free blocks plus blocks eviction can free. The pins above already count:
     // a matched block and its ancestors are not reclaimable for this request.
     auto needed = blocks_for(prompt.size()) - hit.size();
-    if (!has_room(needed)) return reject(needed);
+    if (!has_room(needed)) {
+        OpResult rejected = reject(needed); // message counts with the pins in place
+        table.clear();
+        refresh_blocks(hit); // released again: back to the state before the ADMIT
+        return rejected;
+    }
 
     // The reused blocks were accessed, and the deepest one may have been an
     // evictable leaf until this request pinned it (the others have children).
@@ -218,8 +231,15 @@ OpResult KVCacheManager::append(const RequestId& id, Token token) {
 
     auto copies_before = state.table.copy_count();
     auto hash = state.prefix_hash;
+    // Copy-on-write replaces a shared partial tail by a private copy and drops
+    // this request's reference to the old one.
+    const bool had_tail = !blocks.empty();
+    const BlockId old_tail = had_tail ? blocks.back() : 0;
     if (!state.table.append(next_payload(hash, token)))
         throw std::logic_error("append ran out of blocks after its capacity check");
+    // Only full blocks are indexed, so that tail never is and this is a no-op
+    // in the tree; it is reported anyway because its reference count changed.
+    if (had_tail && state.table.copy_count() != copies_before) refresh_blocks({old_tail});
     state.prefix_hash = hash;
     state.tokens.push_back(token);
     if (state.tokens.size() % pool_->tokens_per_block() == 0) index_full_blocks(state);
@@ -243,6 +263,9 @@ OpResult KVCacheManager::fork(const RequestId& new_id, const RequestId& src_id) 
     if (config_.sharing) {
         // Share every block, including a partial tail. Needs no new blocks.
         table = source.table.fork();
+        // Every shared block was retained. The source still holds them, so no
+        // held state changes, but the tree's contract is one refresh per retain.
+        refresh_blocks(table.blocks());
     } else {
         // Baseline: an independent copy, one fresh block per source block. The
         // index is empty when sharing=off, so there is nothing to evict.
@@ -273,6 +296,7 @@ OpResult KVCacheManager::release(const RequestId& id) {
     for (BlockId block : blocks)
         if (pool_->references(block) == 1) result.freed.push_back(block);
     requests_.erase(it); // ~BlockTable releases every reference
+    refresh_blocks(blocks); // released: some may no longer be held
     // A cached leaf that no request holds any more becomes evictable.
     for (BlockId block : blocks)
         if (tree_.contains(block)) policy_->set_evictable(block, tree_.is_evictable(block));
