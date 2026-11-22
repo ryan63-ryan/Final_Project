@@ -4,7 +4,7 @@
   python3 scripts/plot.py              # appendix figures -> results/figures/
   python3 scripts/plot.py --report     # report figures   -> results/figures/report/
   python3 scripts/plot.py --csv a.csv b.csv --out some/dir --size 10k --capacity 1024
-  python3 scripts/plot.py --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"
+  python3 scripts/plot.py --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"
 
 Rows from all --csv files are pooled (default: results/raw/sweep*.csv).
 
@@ -39,7 +39,8 @@ range.
 
 --compare LABEL=FILE adds another sweep of the same traces, made with a different
 setting or build (for example reclaimable=scan), to admit_latency_vs_capacity.png
-as one more series (its sharing-on LRU rows). Its rows are kept apart from the
+as one more series (its sharing-on LRU rows); the pooled sharing-on series is then
+labelled with its own reclaimable setting. Its rows are kept apart from the
 pooled ones, and the file is left out of the default results/raw/sweep*.csv pool.
 Give the option once per sweep.
 
@@ -309,16 +310,18 @@ def admit_latency_figure(plt, layout, groups, compare, capacities, size, path):
     """ADMIT median and p99 by capacity: sharing on (LRU) against off, plus later builds."""
     from matplotlib.ticker import FuncFormatter
     modes = layout.modes({key[0] for key in groups if key[1] == size})
-    drawn = [(groups, ON_LRU), (groups, OFF)]
+    # Next to another sweep, say how the pooled one counted reclaimable blocks.
+    kinds = {row.get("reclaimable") for rows in groups.values() for row in rows}
+    names = {"count": "O(1) count", "scan": "O(capacity) scan"}
+    on_lru = ON_LRU
+    if compare and len(kinds) == 1 and kinds <= set(names):
+        on_lru = (ON_LRU[0], "%s, %s" % (ON_LRU[1], names[kinds.pop()])) + ON_LRU[2:]
+    drawn = [(groups, on_lru), (groups, OFF)]
     for (label, other), look in zip(compare, COMPARE_STYLES):
         drawn.append((other, (("on", "lru"), label) + look))
     note = ("Time of the admit call alone, %s-request traces. Point: median over the "
             "repetitions of each run's median (top) or 99th percentile (bottom). Bar: "
             "interquartile range over the repetitions. Sharing on is shown for LRU only." % size)
-    kinds = {row.get("reclaimable") for rows in groups.values() for row in rows}
-    if compare and len(kinds) == 1 and None not in kinds:
-        note += (" Series that do not name a setting were run with reclaimable=%s."
-                 % kinds.pop())
     fig = Figure(plt, layout, 2, len(modes), note, len(drawn), "row")
     positions = list(range(len(capacities)))
     rows = [("admit_median_ns", "ADMIT median (µs)"), ("admit_p99_ns", "ADMIT p99 (µs)")]
@@ -474,7 +477,7 @@ def main():
                              "panels only")
     parser.add_argument("--compare", action="append", default=[], metavar="LABEL=FILE",
                         help="overlay a later sweep in admit_latency_vs_capacity.png, e.g. "
-                             "\"Sharing on, LRU, scan=results/raw/scan_sweep.csv\"")
+                             "\"Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv\"")
     parser.add_argument("--fragmentation", default="results/raw/fragmentation.csv",
                         metavar="FILE",
                         help="sweep made with --sample-every, for "

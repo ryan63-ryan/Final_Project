@@ -611,9 +611,9 @@ bash scripts/run_experiments.sh --reps 1 --sample-every 64 \
 # 3. Figures. Needs matplotlib.
 python3 -m pip install matplotlib      # or: sudo apt install python3-matplotlib
 python3 scripts/plot.py \
-    --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"   # -> results/figures/
+    --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"   # -> results/figures/
 python3 scripts/plot.py --report \
-    --compare "Sharing on, LRU, scan=results/raw/scan_sweep.csv"   # -> results/figures/report/
+    --compare "Sharing on, LRU, O(capacity) scan=results/raw/scan_sweep.csv"   # -> results/figures/report/
 ```
 
 `plot.py` pools every `results/raw/sweep*.csv`, so the scan sweep and the sampled run
