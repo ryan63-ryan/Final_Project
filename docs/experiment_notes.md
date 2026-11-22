@@ -352,16 +352,25 @@ for example the ADMIT median for `unique` at capacity 4,096 with sharing on rang
 
 ## 7. Figures
 
-All in `results/figures/`, one panel per workload, with three series: sharing on with
+`scripts/plot.py` writes two sets from the same data:
+
+- **Report set**, `results/figures/report/` (`plot.py --report`): 7 inches wide for a
+  single-column report, with three panels: `system`, `multiturn` and `skewed_short`.
+- **Appendix set**, `results/figures/` (`plot.py`): one panel per workload, all five.
+
+Unless noted, a figure has one panel per workload and three series: sharing on with
 LRU, sharing on with FIFO, and sharing off. The capacity figures use the 100k traces.
 
-| File | What it shows |
-|---|---|
-| `hit_rate_vs_capacity.png` | Share of prompt tokens served from the cache at each capacity; the only panel where the LRU and FIFO lines separate is `skewed_short`. |
-| `uncached_tokens_vs_capacity.png` | Prompt tokens written fresh (recomputation proxy) at each capacity; read it next to the admitted share, since rejected requests write nothing. |
-| `admitted_vs_capacity.png` | Share of ADMITs accepted at each capacity; shows the saturation at 256 blocks and where sharing admits more. |
-| `peak_blocks_vs_capacity.png` | Most blocks allocated at once; sharing on fills the pool with cached blocks, sharing off shows live demand. |
-| `latency_vs_size.png` | Median latency of ADMIT, APPEND, FORK and RELEASE by trace size at capacity 1,024, with the interquartile range over repetitions, on a log scale. |
+| File | Set | What it shows |
+|---|---|---|
+| `hit_rate_vs_capacity.png` | both | Share of prompt tokens served from the cache at each capacity; the only panel where the LRU and FIFO lines separate is `skewed_short`. |
+| `uncached_tokens_vs_capacity.png` | both | Uncached prompt tokens per admitted request (recomputation proxy) at each capacity, each panel on its own scale; dividing by admitted requests keeps configurations with different admission rates comparable. |
+| `uncached_tokens_vs_capacity_total.png` | both | The same as an absolute count over the whole trace; a lower total can mean fewer admitted requests, so read it next to the admitted share. |
+| `admitted_vs_capacity.png` | both | Share of ADMITs accepted at each capacity; shows the saturation at 256 blocks and where sharing admits more. |
+| `admit_latency_vs_capacity.png` | both | ADMIT median (top) and p99 (bottom) at each capacity, sharing on with LRU against sharing off, with the interquartile range over repetitions; shows the cost of sharing growing with capacity. A later sweep can be overlaid with `--compare` (section 8). |
+| `lru_minus_fifo.png` | both | For `skewed` and `skewed_short`: LRU minus FIFO hit rate in percentage points (left) and LRU minus FIFO evictions as a percentage of FIFO's (right) at each capacity. Two panels by measure, two series by workload; identical in both sets apart from size. |
+| `latency_vs_size.png` | both | Median latency of ADMIT, APPEND, FORK and RELEASE by trace size at capacity 1,024, with the interquartile range over repetitions, on a log scale. |
+| `peak_blocks_vs_capacity.png` | **appendix only** | Most blocks allocated at once; sharing on fills the pool with cached blocks, sharing off shows live demand. Not drawn with `--report`: every sharing-on point simply equals the capacity. |
 
 ## 8. Reproducing
 
@@ -382,8 +391,23 @@ scripts/run_experiments.sh --modes "skewed skewed_short" \
 
 # 3. Figures from every results/raw/sweep*.csv. Needs matplotlib.
 python3 -m pip install matplotlib      # or: sudo apt install python3-matplotlib
-python3 scripts/plot.py
+python3 scripts/plot.py                # appendix set -> results/figures/
+python3 scripts/plot.py --report       # report set   -> results/figures/report/
 ```
+
+After Bowen's O(1) reclaimable count lands, run the same sweeps with the new build into
+files that do not match `sweep*.csv`, and overlay them in
+`admit_latency_vs_capacity.png`:
+
+```sh
+scripts/run_experiments.sh --out results/raw/o1_sweep.csv
+python3 scripts/plot.py --report \
+    --compare "Sharing on, O(1) count=results/raw/o1_sweep.csv"
+```
+
+`--compare` takes one CSV; that run puts all five workloads in it. The overlay draws
+that file's sharing-on LRU rows as a third series. The counters in it must equal the
+committed ones; only the latencies should change.
 
 Useful variants:
 
