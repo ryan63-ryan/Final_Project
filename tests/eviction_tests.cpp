@@ -192,6 +192,88 @@ void parent_recheck() {
     }
 }
 
+// Evicts until nothing is evictable. Each evict_one call must remove exactly one
+// physical block, and afterwards the policy's evictable set must match the tree
+// (this is where a missed parent re-check would show).
+Ids drain_checked(BlockPool& pool, RadixTree& tree, EvictionPolicy& policy, const Ids& all) {
+    Ids order;
+    for (;;) {
+        auto size = tree.size();
+        auto free = pool.free_count();
+        auto id = evict_one(tree, policy);
+        if (!id) {
+            CHECK(tree.size() == size && pool.free_count() == free);
+            return order;
+        }
+        order.push_back(*id);
+        CHECK(tree.size() == size - 1 && pool.free_count() == free + 1 && !tree.contains(*id));
+        std::size_t evictable = 0;
+        for (BlockId block : all) evictable += tree.is_evictable(block) ? 1 : 0;
+        CHECK(policy.evictable_count() == evictable);
+        CHECK(policy.check_invariants() && tree.check_invariants());
+    }
+}
+
+// Several blocks on one compressed edge are still evicted one physical block at a
+// time, from the end of the edge, with the parent re-checked after each.
+template <class Policy>
+void compressed_edges(bool lru) {
+    {
+        BlockPool pool(4, 2, 1);
+        RadixTree tree(pool);
+        Policy policy;
+        BlockId a = cache_block(pool, tree, policy, {1, 1});
+        BlockId b = cache_block(pool, tree, policy, {1, 1, 2, 2});
+        BlockId c = cache_block(pool, tree, policy, {1, 1, 2, 2, 3, 3});
+        CHECK(tree.node_count() == 1 && policy.evictable_count() == 1 && policy.victim() == c);
+        CHECK((drain_checked(pool, tree, policy, {a, b, c}) == Ids{c, b, a}));
+        CHECK(tree.node_count() == 0 && pool.free_count() == pool.capacity());
+    }
+    {
+        // A request holds the edge up to B: only C may go, B and A stay.
+        BlockPool pool(4, 2, 1);
+        RadixTree tree(pool);
+        Policy policy;
+        BlockId a = cache_block(pool, tree, policy, {1, 1});
+        BlockId b = cache_block(pool, tree, policy, {1, 1, 2, 2});
+        BlockId c = cache_block(pool, tree, policy, {1, 1, 2, 2, 3, 3});
+        auto request = hit(pool, tree, policy, {1, 1, 2, 2, 9});
+        CHECK((request.blocks() == Ids{a, b}));
+        CHECK((drain_checked(pool, tree, policy, {a, b, c}) == Ids{c}));
+        CHECK(tree.contains(a) && tree.contains(b) && tree.is_leaf(b) && !tree.is_evictable(b));
+        finish(request, tree, policy);
+        CHECK((drain_checked(pool, tree, policy, {a, b, c}) == Ids{b, a}));
+    }
+    {
+        // After a split [A|B] -> {[C], [D]}, B waits for its last child.
+        BlockPool pool(5, 2, 1);
+        RadixTree tree(pool);
+        Policy policy;
+        BlockId a = cache_block(pool, tree, policy, {1, 1});
+        BlockId b = cache_block(pool, tree, policy, {1, 1, 2, 2});
+        BlockId c = cache_block(pool, tree, policy, {1, 1, 2, 2, 3, 3});
+        BlockId d = cache_block(pool, tree, policy, {1, 1, 2, 2, 7, 7});
+        CHECK(tree.node_count() == 3 && policy.evictable_count() == 2 && policy.victim() == c);
+        CHECK((drain_checked(pool, tree, policy, {a, b, c, d}) == Ids{c, d, b, a}));
+    }
+    {
+        // Two compressed edges [A1|A2] and [B1|B2]; a hit reuses A1 and A2.
+        BlockPool pool(5, 2, 1);
+        RadixTree tree(pool);
+        Policy policy;
+        BlockId a1 = cache_block(pool, tree, policy, {1, 1});
+        BlockId a2 = cache_block(pool, tree, policy, {1, 1, 2, 2});
+        BlockId b1 = cache_block(pool, tree, policy, {3, 3});
+        BlockId b2 = cache_block(pool, tree, policy, {3, 3, 4, 4});
+        CHECK(tree.node_count() == 2);
+        auto request = hit(pool, tree, policy, {1, 1, 2, 2});
+        finish(request, tree, policy);
+        auto order = drain_checked(pool, tree, policy, {a1, a2, b1, b2});
+        CHECK(order == (lru ? Ids{b2, b1, a2, a1} : Ids{a2, a1, b2, b1}));
+        CHECK(pool.free_count() == pool.capacity());
+    }
+}
+
 void api_tests() {
     LRUPolicy lru;
     FIFOPolicy fifo;
@@ -329,6 +411,9 @@ int main() {
         parent_recheck<LRUPolicy>();
         parent_recheck<FIFOPolicy>();
         std::cout << "PASS parent re-checked after its last child is evicted\n";
+        compressed_edges<LRUPolicy>(true);
+        compressed_edges<FIFOPolicy>(false);
+        std::cout << "PASS compressed edges evict one block at a time; LRU B2,B1,A2,A1 vs FIFO A2,A1,B2,B1\n";
         for (unsigned seed : {538u, 2026u, 17u}) {
             random_tests<LRUPolicy>(seed, 6000, true);
             random_tests<FIFOPolicy>(seed, 6000, false);
