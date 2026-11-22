@@ -4,7 +4,7 @@ EE538 Final Project, USC Fall 2026, Track B (LLM/MLSys module).
 
 We built a KV-cache manager in C++17. It keeps each request's data in fixed-size blocks
 taken from a pool with a hard size limit. Requests with the same prompt prefix share
-blocks through a radix tree, a forked request shares everything with its parent until
+blocks through a compressed radix tree, a forked request shares everything with its parent until
 one of them writes, and when the pool is full we evict cached blocks using LRU or FIFO.
 We don't run a real model: the bytes stored for each token are computed from the token
 prefix, which is enough to test sharing and isolation.
@@ -20,7 +20,7 @@ The scope we agreed on is in the [proposal](EE538_Final_Project_Proposal.pdf).
 | Yingtao Yang | Config and trace parser, the driver, `KVCacheManager` integration, experiments. Integration lead |
 
 Things that are not finished yet are marked **TODO** in this file: `ReferenceCache`,
-radix compression, the O(1) reclaimable count, the report PDF and the AI-use section.
+the O(1) reclaimable count, the report PDF and the AI-use section.
 
 ## Build
 
@@ -163,8 +163,9 @@ What each test file covers:
 | File | What it checks |
 |---|---|
 | `tests/storage_tests.cpp` | Pool accounting, copy-on-write, ownership, running out of blocks, moves. 27,000 random steps compared with plain vectors. Heap order with 30,000 random steps compared with a linear scan |
-| `tests/radix_tests.cpp` | `match`, `insert`, `erase`, who owns which reference. 30,000 random steps compared with a `std::map` |
-| `tests/eviction_tests.cpp` | LRU vs FIFO order, blocks in use are never evicted, parent becomes evictable after its last child goes. 36,000 random steps compared with a scan |
+| `tests/radix_tests.cpp` | `match`, `insert`, `erase`, who owns which reference. Compressed edges: a match that ends in the middle of an edge, splits after the first block and after a middle block, split tails keep their children. 30,000 random steps compared with a `std::map` |
+| `tests/radix_fault_tests.cpp` | Makes every allocation fail in turn during an edge extension, a new edge and two kinds of split, and checks nothing changed or leaked |
+| `tests/eviction_tests.cpp` | LRU vs FIFO order, blocks in use are never evicted, parent becomes evictable after its last child goes, evicting a compressed edge one block at a time. 36,000 random steps compared with a scan |
 | `tests/manager_tests.cpp` | The proposal example, fork and copy-on-write, a prefix-reuse trace and an LRU/FIFO eviction trace we calculated by hand, rejects that must not change anything, `sharing=off`, bad request IDs, and 24,000 random operations |
 | `tests/golden/example.*` | proposal example through the driver |
 | `tests/golden/eviction*` | same eviction trace with LRU, FIFO and `sharing=off` |
@@ -242,7 +243,7 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Fork and append: private copy on write | A shared partial block is copied before writing | `cow_tests`, `tests/golden/example.*` |
 | Release in any order keeps counts correct | Destructors release references; invariants check every count | `release_tests`, `random_tests` |
 | Blocks in use are never evicted; defined failure when there's no room | Only unused leaf blocks can be evicted. ADMIT is rejected before anything changes | `eviction_capacity_tests`, `tests/eviction_tests.cpp` |
-| Prefix index: splits, inserts, removals | Insert/erase/match with one node per block. **TODO:** edge splits are on `bowen/radix-compression`, not merged yet | `tests/radix_tests.cpp`, `heal_tests` |
+| Prefix index: splits, inserts, removals | Edges hold runs of whole blocks. Inserting in the middle of an edge splits it at a block boundary, erase removes one block at a time. Lookup results are the same as with one node per block | `src/radix_tree.cpp` (`split_insert`, `extend`, `erase`), `tests/radix_tests.cpp`, `tests/radix_fault_tests.cpp`, `heal_tests` in `tests/manager_tests.cpp` |
 | Sharing off/on and LRU/FIFO on the same traces, with a "sharing is rare" workload and one under memory pressure | `unique` workload; capacity 256 | `scripts/run_experiments.sh`, `docs/experiment_notes.md` sec. 5 |
 | Report reuse, storage waste, latency, proxy definition | Hit rate, uncached tokens, latency per operation. **TODO:** fragmentation is saved in the CSVs (`fragmentation_slots`) but we haven't analyzed it | `docs/experiment_notes.md`, `results/raw/` |
 
@@ -264,14 +265,14 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 
 | | What | Where |
 |---|---|---|
-| Data structure 1 | Radix tree (prefix index) | `src/radix_tree.cpp` |
+| Data structure 1 | Compressed radix tree (prefix index) | `include/kvcache/radix_tree.h`, `src/radix_tree.cpp` |
 | Data structure 2 | Indexed binary min-heap | `include/kvcache/min_heap.h` |
 | Data structure 3 | Block pool with free list and reference counts | `src/block_pool.cpp` |
-| Algorithm 1 | Longest-prefix match | `RadixTree::match` in `src/radix_tree.cpp` |
+| Algorithm 1 | Longest-prefix match with edge splits | `RadixTree::match`, `split_insert` in `src/radix_tree.cpp` |
 | Algorithm 2 | Copy-on-write with reference counting | `BlockTable::append` in `src/block_table.cpp` |
 | Algorithm 3 | Greedy leaf eviction with cascade, plus counting how many blocks can be reclaimed | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_blocks`, `make_room` in `src/kv_cache_manager.cpp` |
 | How they work together | One ADMIT uses all of them: the tree finds the prefix, reference counts tell which cached blocks are unused, the heap orders them, eviction removes leaves from the tree, and the freed blocks are written and indexed | `KVCacheManager::admit` |
-| Radix compression (proposal sec. 4) | **TODO:** on branch `bowen/radix-compression`, not merged | |
+| Radix compression (proposal sec. 4) | An edge stores a run of full blocks and their tokens. Edges are extended, split and shortened only at block boundaries | `src/radix_tree.cpp`, `docs/radix_and_eviction.md` |
 
 ### Testing
 
@@ -334,7 +335,10 @@ The short version:
   rest (free blocks + blocks we could evict), evict if needed, write only the tokens
   that weren't cached, then add the newly filled blocks to the index. If there isn't
   room we reject and nothing has changed.
-- **Eviction.** We only evict a leaf of the tree that no request is using, so we never
+- **Radix tree.** An edge holds a run of full blocks, so a long prompt that nobody
+  branches off from is one node. The interface is still per block. If a new request
+  branches off in the middle of an edge, the edge is split at that block boundary.
+- **Eviction.** We only evict the last block of a leaf edge that no request is using, so we never
   cut off a longer cached prefix. After a leaf goes, its parent may become a leaf and
   can be evicted next. LRU updates a block's position when it is reused, FIFO doesn't.
 
@@ -352,18 +356,18 @@ E = evictable blocks.
 | `BlockTable::append` | O(P), or O(B P) with copy-on-write | table growth is amortized O(1) |
 | `BlockTable::fork`, `from_prefix`, `clear` | O(L) | |
 | `MinHeap` push/pop/update/erase | O(log E) | key lookup is a hash map, expected O(1) |
-| `RadixTree::match`, `insert` (k blocks) | O(k B log F) | |
-| `RadixTree::erase`, `contains`, `is_leaf`, `parent` | expected O(1) | hash map |
+| `RadixTree::match`, `insert` (k blocks over e edges, e <= k) | O(k B + e B log F) | extending an edge is amortized O(B); a split also copies the s tail blocks and moves its c children: O(s B + c) |
+| `RadixTree::erase`, `contains`, `is_leaf`, `parent` | expected O(1) | hash map; erase is amortized |
 | Policy `on_insert`/`on_access`/`on_erase`/`set_evictable` | O(log E) | `victim` is O(1) |
-| `admit` | O(k B log F) + O((T - kB) P) + O(log E) per eviction | plus O(C) when the free list isn't enough (see below) |
+| `admit` | O(k B + e B log F) + O((T - kB) P) + O(log E) per eviction | plus O(C) when the free list isn't enough (see below) |
 | `append` | O(P) amortized, O(B P) with copy-on-write | plus O(L B log F) when the block fills up and gets indexed |
 | `fork` | O(L) with sharing, O(T P) without | the baseline copies everything |
 | `release` | O(L log E) | |
 | `stats` | O(C) | scans for fragmentation |
 
 Unless marked, these are worst case. "Expected" ones go through a hash map and can be
-worse with bad collisions. Space is O(C B P) for payload, O(N B) tokens for N indexed
-blocks, and O(T) tokens per live request.
+worse with bad collisions. Space is O(C B P) for payload, O(N B) tokens and at most N
+tree nodes for N indexed blocks, and O(T) tokens per live request.
 
 **TODO (O(1) reclaimable count):** when the free list is too short, `admit` scans all
 blocks to count what could be evicted. We think this is why ADMIT gets slower with
@@ -376,7 +380,10 @@ experiments after that.
 - If an APPEND is rejected, the request stays alive and just misses that token. A real
   server would probably cancel it. Details in
   [docs/integration_notes.md](docs/integration_notes.md), section 7.
-- Radix edges are not compressed yet (TODO).
+- The radix tree doesn't merge nodes back after an erase. After eviction a node can be
+  left with a single child, so the tree is not always fully compressed. This only
+  affects the node count, not results. (Merging would need to allocate inside `erase`,
+  and eviction relies on `erase` not throwing.)
 - No separate `ReferenceCache` class yet (TODO).
 - ADMIT gets slower as capacity grows when sharing is on (TODO above).
 - Single-threaded only. No GPU, no real model, no distributed serving.
@@ -395,7 +402,7 @@ include/kvcache/     headers
   block_pool.h         pool of blocks, free list, reference counts
   block_table.h        blocks of one request; append, fork, from_prefix
   min_heap.h           MinHeap<T, Compare> template
-  radix_tree.h         prefix index
+  radix_tree.h         prefix index (radix tree with compressed edges)
   eviction_policy.h    EvictionPolicy, LRUPolicy, FIFOPolicy, evict_one
   kv_cache_manager.h   KVCacheManager
   config.h, trace.h, types.h
