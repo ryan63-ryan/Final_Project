@@ -24,6 +24,7 @@ Figures:
   admit_latency_vs_capacity.png      ADMIT median and p99, sharing on (LRU) vs off
   lru_minus_fifo.png                 LRU minus FIFO: hit rate and evictions, skewed workloads
   latency_vs_size.png                per-operation latency by trace size
+  fragmentation_vs_capacity.png      empty token slots in allocated blocks, mean over the run
   peak_blocks_vs_capacity.png        most blocks allocated at once (appendix only)
 
 Series in the per-workload figures: sharing on with LRU, sharing on with FIFO, and
@@ -41,6 +42,11 @@ setting or build (for example reclaimable=scan), to admit_latency_vs_capacity.pn
 as one more series (its sharing-on LRU rows). Its rows are kept apart from the
 pooled ones, and the file is left out of the default results/raw/sweep*.csv pool.
 Give the option once per sweep.
+
+fragmentation_vs_capacity.png is drawn from a separate run made with
+run_experiments.sh --sample-every (default results/raw/fragmentation.csv, see
+--fragmentation); the latency sweeps do not sample. It is skipped if the file is
+missing.
 
 Needs matplotlib. The CSVs are read with the standard library.
 """
@@ -334,6 +340,27 @@ def admit_latency_figure(plt, layout, groups, compare, capacities, size, path):
     fig.save("ADMIT latency by capacity", path)
 
 
+def fragmentation_figure(plt, layout, source, capacities, size, path):
+    """Mean empty token slots in allocated blocks, from a run with --sample-every."""
+    if not os.path.exists(source):
+        print("skipped", path, "(no %s)" % source)
+        return
+    sampled = load([source])
+    check_deterministic(sampled)
+    rows = [row for group in sampled.values() for row in group]
+    if any(row.get("stat_samples", 0) == 0 for row in rows):
+        sys.exit("error: %s has rows without samples; run it with --sample-every" % source)
+    slots = rows[0]["tokens_per_block"]
+    capacity_figure(
+        plt, layout, sampled, capacities, size, lambda r: r["mean_fragmentation_slots"],
+        "Empty token slots (mean)", "Fragmentation by capacity",
+        "Token slots that are allocated but empty (partial last blocks of running "
+        "requests), mean over samples taken every few operations, %s-request traces. "
+        "A block has %d slots. Sharing on and off overlap where both admit every "
+        "request." % (size, slots),
+        path)
+
+
 def lru_minus_fifo_figure(plt, layout, groups, capacities, size, path):
     """LRU minus FIFO for the skewed workloads: hit rate and evictions."""
     from matplotlib.ticker import FuncFormatter
@@ -448,6 +475,10 @@ def main():
     parser.add_argument("--compare", action="append", default=[], metavar="LABEL=FILE",
                         help="overlay a later sweep in admit_latency_vs_capacity.png, e.g. "
                              "\"Sharing on, LRU, scan=results/raw/scan_sweep.csv\"")
+    parser.add_argument("--fragmentation", default="results/raw/fragmentation.csv",
+                        metavar="FILE",
+                        help="sweep made with --sample-every, for "
+                             "fragmentation_vs_capacity.png (default: %(default)s)")
     parser.add_argument("--size", default=None,
                         help="trace size for the capacity figures (default: largest in the CSV)")
     parser.add_argument("--capacity", type=int, default=None,
@@ -532,6 +563,8 @@ def main():
                          target("admit_latency_vs_capacity.png"))
     lru_minus_fifo_figure(plt, layout, groups, capacities, size, target("lru_minus_fifo.png"))
     latency_figure(plt, layout, groups, sizes, capacity, target("latency_vs_size.png"))
+    fragmentation_figure(plt, layout, args.fragmentation, capacities, size,
+                         target("fragmentation_vs_capacity.png"))
     if not args.report:
         capacity_figure(
             plt, layout, groups, capacities, size, lambda r: r["peak_used_blocks"],
