@@ -179,9 +179,13 @@ private:
     std::vector<std::string> trace_;
 };
 
+// main() runs the hand and random traces once per mode (count, then scan).
+ReclaimableKind reclaimable_mode = ReclaimableKind::Count;
+
 Config config(std::size_t capacity, std::size_t width, bool sharing = true,
               PolicyKind policy = PolicyKind::LRU) {
     Config result;
+    result.reclaimable = reclaimable_mode;
     result.capacity = capacity;
     result.tokens_per_block = width;
     result.bytes_per_token = 8;
@@ -379,9 +383,12 @@ int main() {
     try {
         parser_checks();
         std::cout << "PASS malformed commands and valid trace boundaries\n";
-        hand_traces();
-        std::cout << "PASS hand-calculated ReferenceCache traces\n";
-        for (unsigned seed : {17U, 538U, 2026U, 991U}) random_traces(seed, 400);
+        for (ReclaimableKind mode : {ReclaimableKind::Count, ReclaimableKind::Scan}) {
+            reclaimable_mode = mode;
+            hand_traces();
+            for (unsigned seed : {17U, 538U, 2026U, 991U}) random_traces(seed, 400);
+        }
+        std::cout << "PASS hand-calculated ReferenceCache traces (reclaimable=count and scan)\n";
         if (coverage.rejected == 0 || coverage.errors == 0 || coverage.hits == 0 ||
             coverage.copies == 0 || coverage.evictions == 0)
             throw std::runtime_error("incomplete differential test coverage");
