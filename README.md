@@ -225,39 +225,112 @@ are a proxy for recomputation; no model-serving speedup is claimed.
 
 ## Requirements, implementation and evidence
 
+The rows follow the Phase II sections of the assignment in order. Paths are relative to
+the repository root. Items that are not done are marked **TODO**.
+
+### Project standard (Track B: LLM/MLSys module)
+
 | Requirement | Implementation | Evidence |
 |---|---|---|
-| Substantive custom work | Block pool with free list and reference counts, block tables with copy-on-write, radix prefix index, indexed heap, LRU/FIFO policies and the manager are written by the team; STL containers only as supporting storage | `src/`, `include/kvcache/` |
-| Operational completeness | ADMIT, APPEND, FORK, RELEASE and STATS through a CLI that reads a config and a trace; every operation is all-or-nothing; defined errors for missing files, malformed lines and invalid IDs | `src/main.cpp`, `src/kv_cache_manager.cpp`, `src/trace.cpp`, `src/config.cpp`, `tests/golden/` |
-| Design comparison | Prefix sharing against an independent-allocation baseline (`sharing=off`), and LRU against FIFO, replaying identical traces at the same capacity | `include/kvcache/config.h`, `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sections 4 and 5 |
-| Evaluation | Hit rate, uncached tokens, admission, blocks, latency and memory across workloads, capacities and sizes | `docs/experiment_notes.md`, `results/raw/`, `results/figures/` |
-| C++: classes | `BlockPool`, `BlockTable`, `RadixTree`, `KVCacheManager`, policies | `include/kvcache/*.h` |
-| C++: template | `MinHeap<T, Compare>`, an indexed binary heap | `include/kvcache/min_heap.h` |
-| C++: RAII and ownership | `BlockTable` and `RadixTree` release their pool references in their destructors; copying is disabled, moves transfer ownership; `RadixTree` owns nodes with `unique_ptr` | `src/block_table.cpp`, `src/radix_tree.cpp`, `include/kvcache/block_pool.h` |
-| C++: inheritance and virtual calls | Abstract `EvictionPolicy`; `RankedPolicy` base; `LRUPolicy` and `FIFOPolicy` override `on_access`; the manager calls them through `unique_ptr<EvictionPolicy>` | `include/kvcache/eviction_policy.h`, `src/eviction_policy.cpp` |
-| C++: file input | Config file and trace file parsers with line-numbered errors | `src/config.cpp`, `src/trace.cpp`, `src/main.cpp` |
-| C++: multiple files and build | 8 source files, 9 headers, Make and CMake builds | `Makefile`, `CMakeLists.txt` |
-| Data structure 1 | Radix tree over full blocks (prefix index) | `include/kvcache/radix_tree.h`, `src/radix_tree.cpp` |
-| Data structure 2 | Indexed min-heap with key lookup, `update` and `erase` | `include/kvcache/min_heap.h` |
+| Substantive custom work: the central systems challenge and the interacting responsibilities | Keeping ownership correct while blocks are shared three ways at once: by requests (block tables), by forks (copy-on-write) and by the prefix cache (index reference), under a hard capacity limit with eviction. Pool, tables, index, policies and manager each own one part and must agree on every reference count | `src/kv_cache_manager.cpp`, `src/block_table.cpp`, `src/radix_tree.cpp`, `src/eviction_policy.cpp`; `docs/integration_notes.md` |
+| Operational completeness: a workflow and its nontrivial cases | Request lifecycle ADMIT, APPEND, FORK, RELEASE with shared-buffer ownership, admission against free plus reclaimable capacity, eviction with cascade, and all-or-nothing rejection | `src/kv_cache_manager.cpp`, `src/main.cpp`, `tests/manager_tests.cpp`, `tests/golden/` |
+| An inspectable design choice: a baseline against an alternative under the same semantics, with the reason for the trade-off | Independent allocation (`sharing=off`) against prefix sharing, and LRU against FIFO, on identical traces and capacity. Sharing saves tokens and admits more requests but makes ADMIT slower | `include/kvcache/config.h`, `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sections 4 and 5 |
+| Meaningful evaluation: correctness, scaling, sensitivity to workload or configuration, with enough workload diversity to show strengths and limitations | Five workloads (including one where sharing never helps and one where LRU and FIFO differ), three capacities, three sizes; results include cases where the alternative is slower | `docs/experiment_notes.md`, `results/raw/`, `results/figures/` |
+| Feasible boundaries: work we own, reusable infrastructure, explicit non-goals | Own: everything in `src/` and `include/`. Reused: the C++ standard library, Python and matplotlib for scripts. Non-goals: GPU kernels, real models, threading, distributed serving | [Known limitations](#known-limitations); `EE538_Final_Project_Proposal.pdf` section 3 |
+| Module track: input/output and state contract | Trace commands in, one result line per command out; per-operation contracts and the all-or-nothing rule | [Run](#run); `include/kvcache/kv_cache_manager.h`, `include/kvcache/types.h` |
+| Module track: a driver that exercises the real implementation | `kvcache` replays a trace against the manager; blocks, reference counts, lookups and eviction all execute on real buffers | `src/main.cpp` |
+| Module track: an independent correctness reference | Bytes of every live request recomputed from its tokens alone; scan-based models in the unit tests. **TODO:** a standalone `ReferenceCache` class and brute-force checks of expected prefix hits are not written yet | `tests/manager_tests.cpp` (`expected_bytes`, `random_tests`) |
+| Module track: the surrounding model replaced by a documented harness | Deterministic payload bytes derived from each token prefix stand in for KV tensors; seeded synthetic traces stand in for a server | `include/kvcache/kv_cache_manager.h` (payload comment), `scripts/gen_trace.py` |
+
+### Module contract (the assignment's paged KV storage example)
+
+| Contract | Implementation | Evidence |
+|---|---|---|
+| Shared prefix: two requests refer to shared immutable prefix blocks without duplicate payloads | ADMIT pins the longest cached run of full blocks with `BlockTable::from_prefix`; full blocks are immutable | `prefix_reuse_tests` in `tests/manager_tests.cpp` |
+| Fork and append: a write to a shared partial block creates a private copy; the other request's bytes are unchanged | `BlockTable::append` clones a shared partial tail first | `cow_tests` in `tests/manager_tests.cpp`; `tests/golden/example.*` |
+| Request completion: reference counts and reclamation stay correct after arbitrary valid release orders | Tables and index release in destructors; invariants compare every count with its holders | `release_tests`, `random_tests` in `tests/manager_tests.cpp`; `tests/storage_tests.cpp` |
+| Capacity and eviction: live blocks are not evicted; insufficient evictable capacity gives a defined decision | Only unheld leaves are evictable; ADMIT is rejected before anything changes if free plus reclaimable blocks are too few | `eviction_capacity_tests` in `tests/manager_tests.cpp`; `tests/eviction_tests.cpp` |
+| Prefix index: splits, insertions and removals preserve longest-prefix lookup and leave no dangling block references | Insert, erase and match on a one-node-per-block tree; evicted ancestors are healed. **TODO:** edge splits exist only on branch `bowen/radix-compression`, not merged | `tests/radix_tests.cpp`; `heal_tests` in `tests/manager_tests.cpp` |
+| Controlled comparison: identical lifecycles with sharing off/on and LRU/FIFO, including a workload where sharing is rare and one with memory pressure | `unique` workload (sharing never helps); capacity 256 (requests rejected) | `scripts/run_experiments.sh`, `docs/experiment_notes.md` section 5 |
+| Report cached-token reuse, storage waste, operation latency and the definition of the recomputation proxy | Hit rate; uncached prompt tokens as the proxy, defined in the notes; per-operation latency. Storage waste is recorded per run as `fragmentation_slots` (empty token slots in allocated blocks) and as peak blocks; **TODO:** fragmentation is in the CSVs but not analyzed in the notes | `docs/experiment_notes.md` sections 2 and 5; `results/raw/*.csv` |
+
+### C++ implementation and design
+
+| Requirement | Implementation | Evidence |
+|---|---|---|
+| Core in C++; Python only for data preparation, plotting and experiment scripts | Manager, storage, index, policies and driver in C++; trace generation, sweep and plots in Python and shell | `src/`, `scripts/` |
+| Classes with encapsulation, clear interfaces, constructors and const-correctness | `BlockPool`, `BlockTable`, `RadixTree`, `EvictionPolicy` family, `KVCacheManager`; private state, `const` queries, `explicit` constructors | `include/kvcache/*.h` |
+| At least one useful class or function template | `MinHeap<T, Compare>`, an indexed binary heap used by the eviction policies | `include/kvcache/min_heap.h` |
+| STL for supporting work; identify what we implement ourselves | `std::vector`, `std::map`, `std::unordered_map`, `std::unique_ptr` hold storage. Implemented by us: the pool and its free list, copy-on-write tables, the radix tree operations, the heap (no `std::priority_queue`), the policies and the manager | `src/`, `include/kvcache/min_heap.h` |
+| RAII; copying and moving handled or disabled | `BlockTable` and `RadixTree` release their pool references in their destructors and are move-only; `BlockPool` is neither copyable nor movable; `RadixTree` owns nodes with `unique_ptr` | `include/kvcache/block_pool.h`, `include/kvcache/block_table.h`, `include/kvcache/radix_tree.h`, `src/block_table.cpp` |
+| Inheritance and virtual dispatch for interchangeable policies | Abstract `EvictionPolicy`; `RankedPolicy` base; `LRUPolicy` and `FIFOPolicy` override `on_access`; the manager holds a `unique_ptr<EvictionPolicy>` chosen from the config | `include/kvcache/eviction_policy.h`, `src/eviction_policy.cpp`, `src/kv_cache_manager.cpp` |
+| Read input from files, handle invalid input, write reproducible results | Config and trace files; line-numbered errors; a bad trace line does not stop the run; deterministic output, seeds in the config and the generator | `src/config.cpp`, `src/trace.cpp`, `src/main.cpp`, `tests/demo_errors.py` |
+| Multiple source and header files with a Makefile or CMake configuration | 8 source files, 9 headers; both a Makefile and CMake | `Makefile`, `CMakeLists.txt` |
+| C++17 or later; compiler, options, dependencies and build command documented | See [Build](#build) | `README.md`, `results/raw/*.meta.txt` |
+| Useful compiler warnings enabled and addressed | `-Wall -Wextra -Wpedantic`; the code also builds with `-Werror` under GCC 13.3 | `Makefile`, `CMakeLists.txt` |
+
+### Data structures and algorithms
+
+| Requirement | Implementation | Evidence |
+|---|---|---|
+| Data structure 1 | Radix tree over full blocks (the prefix index) | `include/kvcache/radix_tree.h`, `src/radix_tree.cpp` |
+| Data structure 2 | Indexed binary min-heap with key lookup, `update` and `erase` | `include/kvcache/min_heap.h` |
 | Data structure 3 | Block pool with a free list and per-block reference counts | `include/kvcache/block_pool.h`, `src/block_pool.cpp` |
-| Algorithm 1 | Longest-prefix match over whole blocks | `RadixTree::match` in `src/radix_tree.cpp`; used by `KVCacheManager::admit` |
-| Algorithm 2 | Copy-on-write with reference counting | `BlockTable::append` in `src/block_table.cpp`, `BlockPool::clone` in `src/block_pool.cpp` |
-| Algorithm 3 | Greedy leaf eviction with cascade, and the reclaimable-capacity check before it | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_blocks` and `make_room` in `src/kv_cache_manager.cpp` |
-| Tests: normal, boundary, error | Empty prompts, exact block boundaries, fork divergence, parent-first release, exhausted capacity, invalid IDs, malformed input | `tests/manager_tests.cpp`, `tests/storage_tests.cpp`, `tests/demo_errors.py` |
-| Tests: invariants | `check_invariants()` on every class, called after each step of the seeded tests and after every driver operation unless `--no-check` | `src/kv_cache_manager.cpp`, `src/radix_tree.cpp`, `src/eviction_policy.cpp`, `src/main.cpp` |
-| Tests: golden | Three traces with five expected outputs (one runs under LRU, FIFO and `sharing=off`), plus the storage demo | `tests/golden/` |
-| Tests: reference | Bytes of every live request recomputed from its tokens alone and compared after each of 24,000 seeded operations; storage, heap, radix and policy tests each compare against a scan-based model. **TODO:** a standalone `ReferenceCache` class and brute-force checks of expected prefix hits are not written yet | `tests/manager_tests.cpp` (`expected_bytes`, `random_tests`), `tests/storage_tests.cpp`, `tests/radix_tests.cpp`, `tests/eviction_tests.cpp` |
-| Tests: sanitizers | All tests pass under AddressSanitizer and UndefinedBehaviorSanitizer | `make sanitize`; `KV_SANITIZE` in `CMakeLists.txt` |
-| Complexity | Time and space of every main operation | [Design notes and complexity](#design-notes-and-complexity) |
-| Experiments: at least 3 sizes | 1k, 10k and 100k requests | `scripts/run_experiments.sh`, `results/raw/sweep.csv` |
-| Experiments: 5 repetitions | Five runs per configuration; median and interquartile range reported | `scripts/run_experiments.sh`, `scripts/plot.py` |
-| Experiments: at least 2 factors | Sharing, policy, capacity and workload | `docs/experiment_notes.md` section 2 |
-| Experiments: time and memory | Per-operation median, p99 and mean latency; total operation and driver time; peak RSS | `src/main.cpp`, `docs/experiment_notes.md` section 5.2 |
-| Experiments: raw data | One CSV row per run, settings files, and scripts that regenerate traces and figures | `results/raw/`, `scripts/` |
-| Radix edge compression (proposal section 4) | **TODO:** the index on this branch has one node per block. Compressed edges with splits at block boundaries are implemented on branch `bowen/radix-compression` and not merged yet | `include/kvcache/radix_tree.h` |
-| Report | **TODO:** report PDF not in the repository yet | |
+| Algorithm 1 | Longest-prefix matching over whole blocks | `RadixTree::match` in `src/radix_tree.cpp`; used by `KVCacheManager::admit` |
+| Algorithm 2 | Copy-on-write with reference counting | `BlockTable::append` in `src/block_table.cpp`; `BlockPool::clone` in `src/block_pool.cpp` |
+| Algorithm 3 | Greedy leaf eviction with cascade, preceded by the reclaimable-capacity computation (marking held blocks and their ancestors) | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_blocks` and `make_room` in `src/kv_cache_manager.cpp` |
+| Why the interaction is substantive | One ADMIT uses all of them: the tree finds the reusable prefix, the pool's counts say which cached blocks are unheld, the heap orders those, eviction removes leaves from the tree (which can expose new candidates), and the freed blocks are written and indexed. A wrong count in any one breaks the others, which is what the manager invariants check | `KVCacheManager::admit` and `check_invariants` in `src/kv_cache_manager.cpp` |
+| Radix edge compression and splits (proposal section 4) | **TODO:** not on this branch; implemented on `bowen/radix-compression`, not merged | |
+
+### Correctness and testing
+
+| Requirement | Implementation | Evidence |
+|---|---|---|
+| A repeatable test command, and what the tests check | `make test`, `make sanitize`, `ctest` | [Test](#test) |
+| Normal behavior, boundary cases and invalid input | Empty prompts, exact block boundaries, a full pool, fork divergence, unknown and duplicate IDs, malformed config and trace input | `tests/manager_tests.cpp`, `tests/storage_tests.cpp`, `tests/demo_errors.py` |
+| Invariants of each custom data structure | `check_invariants()` on the pool, table, heap, tree, policies and manager, called after each step of the seeded tests and after every driver operation unless `--no-check` | `src/block_pool.cpp`, `src/block_table.cpp`, `include/kvcache/min_heap.h`, `src/radix_tree.cpp`, `src/eviction_policy.cpp`, `src/kv_cache_manager.cpp` |
+| Difficult state and resource transitions: updates, sharing, release, capacity failure | Copy-on-write on a shared tail, release orders with shared holders, eviction of an ancestor that a request still mirrors, rejection with a partial prefix hit, move of a manager | `cow_tests`, `release_tests`, `heal_tests`, `eviction_capacity_tests`, `failure_tests` in `tests/manager_tests.cpp` |
+| At least one complete input with an expected output for the whole module | Three traces with five expected outputs (one runs under LRU, FIFO and `sharing=off`), plus the storage demo | `tests/golden/` |
+| Comparison against a simple independent reference | Recomputed bytes after each of 24,000 seeded manager operations; storage against payload vectors, heap against a scan, radix against a map, policies against a scan. **TODO:** `ReferenceCache` (see above) | `tests/manager_tests.cpp`, `tests/storage_tests.cpp`, `tests/radix_tests.cpp`, `tests/eviction_tests.cpp` |
+| Lifetime checks with a sanitizer; platform limitations documented | All tests pass under AddressSanitizer and UndefinedBehaviorSanitizer on Linux (GCC 13.3). No process-wide leak audit beyond what ASan's leak checker reports at exit | `make sanitize`; `KV_SANITIZE` in `CMakeLists.txt` |
+| Known limitations explained rather than claiming the tests prove correctness | Listed with their consequences | [Known limitations](#known-limitations); `docs/integration_notes.md` section 7; `docs/experiment_notes.md` section 6 |
+
+### Complexity and experiments
+
+| Requirement | Implementation | Evidence |
+|---|---|---|
+| Input-size variables; time and space of the main operations; worst-case, average-case and amortized claims distinguished | Table of operations with the kind of each bound | [Design notes and complexity](#design-notes-and-complexity) |
+| Two relevant approaches compared on the same task and inputs | Sharing off against on, and LRU against FIFO, on identical traces | `docs/experiment_notes.md` sections 4 and 5 |
+| At least three input sizes | 1k, 10k and 100k requests | `scripts/run_experiments.sh`, `results/raw/sweep.csv` |
+| Repeated timing runs; number of repetitions, central value and variability reported | Five repetitions per configuration; median and interquartile range | `scripts/run_experiments.sh`, `scripts/plot.py`, `docs/experiment_notes.md` section 2 |
+| Machine, compiler options, input generator and random seed recorded | Written next to each CSV by the sweep script | `results/raw/*.meta.txt`, `docs/experiment_notes.md` sections 2 and 3 |
+| Preprocessing separated from operation time | Only the manager call is timed; parsing, checks and output are outside and reported separately as driver time | `src/main.cpp` (`total_op_ns`, `total_driver_ns`) |
+| Time and memory reported; what the memory figure is and includes | Per-operation median, p99 and mean latency. Memory is measured peak RSS of the whole driver process (`getrusage`), which includes the pool payload, the index and the driver itself; the payload alone is capacity x 16 x 64 bytes | `docs/experiment_notes.md` section 5.2 |
+| At least two workload or configuration factors besides scale | Prefix sharing (five workloads) and cache pressure (three capacities), plus sharing on/off and policy | `docs/experiment_notes.md` sections 2 and 3 |
+| Module boundary, driver overhead and quality constraints; measured time distinguished from proxy metrics | Operation time against total driver time; uncached tokens labeled as a proxy for recomputation, not a measured serving speedup | `docs/experiment_notes.md` sections 1, 2 and 6 |
+| Raw measurements saved; commands reproduce tables and plots; results explained even where slower | One CSV row per run; scripts regenerate traces and figures; the notes explain why ADMIT is slower with sharing | `results/raw/`, `scripts/`, `docs/experiment_notes.md` sections 5 and 8 |
+
+### Submission
+
+| Requirement | Status |
+|---|---|
+| README with build, run, test and experiment commands and this table | This file |
+| Team members and contributions in the README | Table at the top |
+| Sample input and output | `tests/golden/` |
+| Report (design, complexity, correctness checks, measurements, limitations, references, contributions, AI use) | **TODO:** report PDF not in the repository yet |
+| Fixed commit or release tag | **TODO:** tag the submitted version |
+| AI use | **TODO:** [AI use](#ai-use) |
 
 ## Design notes and complexity
+
+Detailed module documentation, written by the authors of each module:
+
+- [docs/storage_module.md](docs/storage_module.md) (Bohan Cui): pool, tables,
+  copy-on-write and heap; API, error behavior, validation and complexity.
+- [docs/radix_and_eviction.md](docs/radix_and_eviction.md) (Bowen Deng): radix index and
+  eviction policies; API, contracts, validation and complexity.
+- [docs/integration_notes.md](docs/integration_notes.md) (Yingtao Yang): how the manager
+  uses them, with hand-calculated traces.
 
 **Ownership.** Each `BlockTable` entry owns one pool reference, and the prefix index
 owns exactly one reference per indexed block. For an indexed block a count of one
@@ -299,6 +372,12 @@ index node, and E the evictable blocks.
 | `KVCacheManager::fork` | O(L) with sharing; O(T P) without | The baseline copies every token |
 | `KVCacheManager::release` | O(L log E) | |
 | `KVCacheManager::stats` | O(C) | Fragmentation scan |
+
+Kinds of bounds: the pool, table and manager costs above are worst-case, except where
+the table says amortized (growth of a block table or of a request's token vector).
+Bounds that go through a hash map (`MinHeap` key lookup; `RadixTree::erase`,
+`contains`, `is_leaf`, `parent`) are expected-case and degrade under adversarial
+collisions. Heap repairs and radix child lookups (`log E`, `log F`) are worst-case.
 
 Space: O(C B P) payload, O(N B) tokens for N indexed blocks, O(N) policy state, and
 O(T) tokens per live request.
@@ -348,6 +427,8 @@ scripts/             gen_trace.py, run_experiments.sh, plot.py
 results/raw/         Sweep CSVs and their settings (.meta.txt)
 results/figures/     Appendix figures; report/ holds the 7-inch report set
 docs/
+  storage_module.md            Storage module details (Bohan Cui)
+  radix_and_eviction.md        Radix index and eviction details (Bowen Deng)
   integration_notes.md         Integration steps, hand-calculated traces, limitations
   experiment_notes.md          Workloads, results, figures, reproduction
   bowen_reclaimable_count.md   Spec for the O(1) reclaimable count
