@@ -15,8 +15,13 @@ void check(bool ok, const char* condition, int line) {
 }
 #define CHECK(condition) check((condition), #condition, __LINE__)
 
+// Every test below builds its configuration here, and main() runs them all
+// once per mode, so each test covers both ways of counting reclaimable blocks.
+ReclaimableKind reclaimable_mode = ReclaimableKind::Count;
+
 Config small_config(bool sharing) {
     Config config;
+    config.reclaimable = reclaimable_mode;
     config.capacity = 4;
     config.tokens_per_block = 2;
     config.bytes_per_token = 64;
@@ -634,6 +639,71 @@ void random_tests() {
     CHECK(operations == 24000);
 }
 
+bool same_result(const OpResult& a, const OpResult& b) {
+    return a.status == b.status && a.blocks == b.blocks && a.cached_tokens == b.cached_tokens &&
+           a.cow_copies == b.cow_copies && a.freed == b.freed && a.evicted == b.evicted &&
+           a.message == b.message;
+}
+
+// reclaimable=scan and reclaimable=count must be indistinguishable from outside.
+// Two managers that differ only in that key replay the same seeded operations;
+// every result (status, block IDs, evicted and freed lists, reject message) and
+// every counter must be equal after every step. Small pool, two-token alphabet:
+// constant eviction, many rejects with partial prefix hits.
+void mode_equivalence_tests() {
+    const char* names[] = {"q0", "q1", "q2", "q3", "q4", "q5"};
+    std::size_t operations = 0, rejects = 0, evictions = 0;
+    for (PolicyKind kind : {PolicyKind::LRU, PolicyKind::FIFO})
+        for (unsigned seed = 101; seed <= 130; ++seed) {
+            Config config = small_config(true);
+            config.capacity = 10;
+            config.bytes_per_token = 8;
+            config.policy = kind;
+            config.reclaimable = ReclaimableKind::Scan;
+            KVCacheManager scan(config);
+            config.reclaimable = ReclaimableKind::Count;
+            KVCacheManager count(config);
+            std::mt19937 random(seed);
+            auto pick = [&](unsigned n) { return static_cast<unsigned>(random() % n); };
+            for (int step = 0; step < 300; ++step, ++operations) {
+                std::string id = names[pick(6)];
+                unsigned op = pick(10);
+                OpResult a, b;
+                if (!scan.has_request(id) && op < 7) {
+                    std::vector<Token> prompt(pick(9));
+                    for (Token& token : prompt) token = static_cast<Token>(pick(2));
+                    a = scan.admit(id, prompt);
+                    b = count.admit(id, prompt);
+                } else if (!scan.has_request(id)) {
+                    std::string source = names[pick(6)];
+                    a = scan.fork(id, source);
+                    b = count.fork(id, source);
+                } else if (op < 7) {
+                    Token token = static_cast<Token>(pick(2));
+                    a = scan.append(id, token);
+                    b = count.append(id, token);
+                } else {
+                    a = scan.release(id);
+                    b = count.release(id);
+                }
+                CHECK(same_result(a, b));
+                CHECK(scan.has_request(id) == count.has_request(id));
+                if (scan.has_request(id)) CHECK(scan.read_request(id) == count.read_request(id));
+                Stats sa = scan.stats(), sb = count.stats();
+                CHECK(sa.admitted == sb.admitted && sa.rejected == sb.rejected);
+                CHECK(sa.cached_tokens == sb.cached_tokens && sa.evictions == sb.evictions);
+                CHECK(sa.used_blocks == sb.used_blocks && sa.cow_copies == sb.cow_copies);
+                CHECK(scan.indexed_blocks() == count.indexed_blocks());
+                CHECK(scan.evictable_blocks() == count.evictable_blocks());
+                CHECK(scan.check_invariants() && count.check_invariants());
+                if (a.status == Status::Reject) ++rejects;
+                evictions += a.evicted.size();
+            }
+        }
+    // The comparison only means something if the slow path ran a lot.
+    CHECK(operations == 18000 && rejects > 500 && evictions > 2000);
+}
+
 // The reclaimable key: default, both values, and a bad value with its line number.
 void config_tests() {
     const char* path = "manager_tests_config.tmp";
@@ -662,19 +732,26 @@ void config_tests() {
 
 int main() {
     try {
-        payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
-        cow_tests(); std::cout << "PASS proposal example, fork and copy-on-write\n";
-        baseline_tests(); std::cout << "PASS sharing=off baseline\n";
-        baseline_bypass_tests(); std::cout << "PASS sharing=off bypasses the prefix index\n";
-        failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact\n";
-        wiring_tests(); std::cout << "PASS index and policy wiring\n";
-        indexing_tests(); std::cout << "PASS full blocks are indexed on fill\n";
-        prefix_reuse_tests(); std::cout << "PASS hand-calculated prefix-reuse trace\n";
-        release_tests(); std::cout << "PASS release marks unheld cached leaves evictable\n";
-        eviction_trace_tests(); std::cout << "PASS hand-calculated LRU and FIFO eviction trace\n";
-        eviction_capacity_tests(); std::cout << "PASS eviction capacity checks are all-or-nothing\n";
-        heal_tests(); std::cout << "PASS evicted ancestor is healed from the request's own blocks\n";
-        random_tests(); std::cout << "PASS 24000 seeded manager operations\n";
+        for (ReclaimableKind mode : {ReclaimableKind::Count, ReclaimableKind::Scan}) {
+            reclaimable_mode = mode;
+            const char* tag = mode == ReclaimableKind::Count ? " [reclaimable=count]\n"
+                                                             : " [reclaimable=scan]\n";
+            payload_tests(); std::cout << "PASS prefix-dependent payloads" << tag;
+            cow_tests(); std::cout << "PASS proposal example, fork and copy-on-write" << tag;
+            baseline_tests(); std::cout << "PASS sharing=off baseline" << tag;
+            baseline_bypass_tests(); std::cout << "PASS sharing=off bypasses the prefix index" << tag;
+            failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact" << tag;
+            wiring_tests(); std::cout << "PASS index and policy wiring" << tag;
+            indexing_tests(); std::cout << "PASS full blocks are indexed on fill" << tag;
+            prefix_reuse_tests(); std::cout << "PASS hand-calculated prefix-reuse trace" << tag;
+            release_tests(); std::cout << "PASS release marks unheld cached leaves evictable" << tag;
+            eviction_trace_tests(); std::cout << "PASS hand-calculated LRU and FIFO eviction trace" << tag;
+            eviction_capacity_tests(); std::cout << "PASS eviction capacity checks are all-or-nothing" << tag;
+            heal_tests(); std::cout << "PASS evicted ancestor is healed from the request's own blocks" << tag;
+            random_tests(); std::cout << "PASS 24000 seeded manager operations" << tag;
+        }
+        mode_equivalence_tests();
+        std::cout << "PASS 18000 operations give identical results with scan and count\n";
         config_tests(); std::cout << "PASS reclaimable config key\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
