@@ -54,6 +54,9 @@ if(BUILD_TESTING)
   add_executable(manager_tests tests/manager_tests.cpp)
   target_link_libraries(manager_tests PRIVATE kvcache_manager)
   add_test(NAME manager_tests COMMAND manager_tests)
+  add_executable(reference_tests tests/reference_cache.cpp tests/reference_tests.cpp src/trace.cpp)
+  target_link_libraries(reference_tests PRIVATE kvcache_manager)
+  add_test(NAME reference_tests COMMAND reference_tests)
   add_test(NAME example_trace_golden COMMAND ${CMAKE_COMMAND}
     -DPROGRAM=$<TARGET_FILE:kvcache>
     -DCONFIG=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/example.cfg
