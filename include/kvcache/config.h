@@ -7,6 +7,12 @@
 namespace kvcache {
 
 enum class PolicyKind { LRU, FIFO };
+// How the manager finds out how many cached blocks eviction could free.
+//   Count  RadixTree::reclaimable_count(), kept up to date by the tree: O(1).
+//   Scan   a scan over every block ID: O(capacity). The original path, kept
+//          for comparison and as the oracle in check_invariants().
+// Both give the same number, so every decision and every output is identical.
+enum class ReclaimableKind { Scan, Count };
 
 // Run configuration. Field names match the BlockPool constructor arguments.
 struct Config {
@@ -15,6 +21,7 @@ struct Config {
     std::size_t bytes_per_token = 64;  // P: fake KV payload bytes per token
     PolicyKind policy = PolicyKind::LRU;
     bool sharing = true;               // false = independent-allocation baseline
+    ReclaimableKind reclaimable = ReclaimableKind::Count;
     std::uint64_t seed = 42;
 };
 
@@ -26,6 +33,7 @@ struct Config {
 //   bytes_per_token=64
 //   policy=lru          # lru | fifo
 //   sharing=on          # on | off
+//   reclaimable=count   # count | scan
 //   seed=42
 //
 // Throws std::runtime_error (with the line number) if the file cannot be opened,

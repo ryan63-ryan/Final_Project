@@ -212,7 +212,7 @@ void write_csv(const Options& options, const Config& config, const Stats& stats,
         for (const char* name : kOpNames)
             out << ',' << name << "_ops," << name << "_median_ns," << name << "_p99_ns,"
                 << name << "_mean_ns";
-        out << ",total_op_ns,total_driver_ns,peak_rss_kib\n";
+        out << ",total_op_ns,total_driver_ns,peak_rss_kib,reclaimable\n";
     }
     out << config.capacity << ',' << config.tokens_per_block << ',' << config.bytes_per_token
         << ',' << (config.policy == PolicyKind::LRU ? "lru" : "fifo") << ','
@@ -226,7 +226,8 @@ void write_csv(const Options& options, const Config& config, const Stats& stats,
     for (const LatencyHistogram& latency : report.latency)
         out << ',' << latency.count() << ',' << latency.percentile(0.5) << ','
             << latency.percentile(0.99) << ',' << latency.mean();
-    out << ',' << report.total_op_ns << ',' << total_driver_ns << ',' << peak_rss_kib() << '\n';
+    out << ',' << report.total_op_ns << ',' << total_driver_ns << ',' << peak_rss_kib() << ','
+        << (config.reclaimable == ReclaimableKind::Count ? "count" : "scan") << '\n';
     if (!out) throw std::runtime_error("cannot write csv file '" + path + "'");
 }
 

@@ -105,6 +105,11 @@ void KVCacheManager::refresh_blocks(const std::vector<BlockId>& blocks) {
 }
 
 std::size_t KVCacheManager::reclaimable_blocks() const {
+    return config_.reclaimable == ReclaimableKind::Count ? tree_.reclaimable_count()
+                                                         : scan_reclaimable_blocks();
+}
+
+std::size_t KVCacheManager::scan_reclaimable_blocks() const {
     // A block is stuck if a request holds it or any block below it: leaves go
     // first, so it can never become an evictable leaf. Mark every held indexed
     // block and walk up; stop at a marked block, whose ancestors are marked too.
@@ -361,9 +366,9 @@ bool KVCacheManager::check_invariants() const {
     if (policy_->evictable_count() != evictable) return false;
     // The tree's incremental count must agree with the pool (every held bit
     // equals references > 1, which fails if a refresh was missed) and with the
-    // manager's own scan over all blocks. Checked whichever one admission uses.
+    // manager's own scan over all blocks. Checked in both reclaimable modes.
     if (!tree_.check_reclaimable()) return false;
-    if (tree_.reclaimable_count() != reclaimable_blocks()) return false;
+    if (tree_.reclaimable_count() != scan_reclaimable_blocks()) return false;
     auto victim = policy_->victim();
     if (victim && !tree_.is_evictable(*victim)) return false;
     if (!config_.sharing) {

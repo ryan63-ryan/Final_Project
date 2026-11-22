@@ -1,5 +1,7 @@
 #include "kvcache/kv_cache_manager.h"
 
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <random>
@@ -632,6 +634,32 @@ void random_tests() {
     CHECK(operations == 24000);
 }
 
+// The reclaimable key: default, both values, and a bad value with its line number.
+void config_tests() {
+    const char* path = "manager_tests_config.tmp";
+    auto load = [&](const std::string& text) {
+        { std::ofstream out(path); out << text; }
+        try {
+            Config config = load_config(path);
+            std::remove(path);
+            return config;
+        } catch (...) {
+            std::remove(path);
+            throw;
+        }
+    };
+    CHECK(Config().reclaimable == ReclaimableKind::Count);
+    CHECK(load("capacity=8\n").reclaimable == ReclaimableKind::Count);
+    CHECK(load("reclaimable=count\n").reclaimable == ReclaimableKind::Count);
+    CHECK(load("capacity=8\nreclaimable = scan  # old path\n").reclaimable == ReclaimableKind::Scan);
+    std::string message;
+    try { load("capacity=8\nreclaimable=fast\n"); } catch (const std::runtime_error& e) { message = e.what(); }
+    CHECK(message == "config line 2: reclaimable must be scan or count");
+    message.clear();
+    try { load("reclaimable=scan\nreclaimable=count\n"); } catch (const std::runtime_error& e) { message = e.what(); }
+    CHECK(message == "config line 2: repeated key 'reclaimable'");
+}
+
 int main() {
     try {
         payload_tests(); std::cout << "PASS prefix-dependent payloads\n";
@@ -647,6 +675,7 @@ int main() {
         eviction_capacity_tests(); std::cout << "PASS eviction capacity checks are all-or-nothing\n";
         heal_tests(); std::cout << "PASS evicted ancestor is healed from the request's own blocks\n";
         random_tests(); std::cout << "PASS 24000 seeded manager operations\n";
+        config_tests(); std::cout << "PASS reclaimable config key\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

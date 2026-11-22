@@ -106,7 +106,9 @@ def load(paths):
             if mode not in MODES or size not in SIZES:
                 sys.exit("error: trace '%s' is not named <mode>_<size>.trace" % name)
             for key, value in row.items():
-                if key not in ("policy", "sharing", "trace"):
+                # "reclaimable" (scan or count) is in sweeps made after the O(1)
+                # count was added; older CSVs do not have the column.
+                if key not in ("policy", "sharing", "trace", "reclaimable"):
                     row[key] = float(value)
             sharing = row["sharing"]
             series = (sharing, row["policy"] if sharing == "on" else None)

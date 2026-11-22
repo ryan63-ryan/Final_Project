@@ -81,6 +81,10 @@ Config load_config(const std::string& path) {
             if (value == "on") config.sharing = true;
             else if (value == "off") config.sharing = false;
             else fail("sharing must be on or off");
+        } else if (key == "reclaimable") {
+            if (value == "count") config.reclaimable = ReclaimableKind::Count;
+            else if (value == "scan") config.reclaimable = ReclaimableKind::Scan;
+            else fail("reclaimable must be scan or count");
         } else if (key == "seed") {
             if (!parse_unsigned(value, config.seed)) fail("seed must be a non-negative integer");
         } else {
