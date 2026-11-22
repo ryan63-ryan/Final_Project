@@ -6,7 +6,7 @@ CORE = src/block_pool.cpp src/block_table.cpp src/radix_tree.cpp src/eviction_po
 HEADERS = $(wildcard include/kvcache/*.h)
 
 .PHONY: all test sanitize clean
-all: $(BUILD)/storage_tests $(BUILD)/radix_tests $(BUILD)/eviction_tests $(BUILD)/block_demo $(BUILD)/kvcache
+all: $(BUILD)/storage_tests $(BUILD)/radix_tests $(BUILD)/eviction_tests $(BUILD)/radix_fault_tests $(BUILD)/block_demo $(BUILD)/kvcache
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -20,6 +20,9 @@ $(BUILD)/radix_tests: tests/radix_tests.cpp $(CORE) $(HEADERS) | $(BUILD)
 $(BUILD)/eviction_tests: tests/eviction_tests.cpp $(CORE) $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
 
+$(BUILD)/radix_fault_tests: tests/radix_fault_tests.cpp $(CORE) $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
+
 $(BUILD)/block_demo: examples/block_demo.cpp $(CORE) $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $< -o $@
 
@@ -30,6 +33,7 @@ test: all
 	./$(BUILD)/storage_tests
 	./$(BUILD)/radix_tests
 	./$(BUILD)/eviction_tests
+	./$(BUILD)/radix_fault_tests
 	./$(BUILD)/block_demo tests/golden/block_demo.in > $(BUILD)/demo.actual
 	diff -u tests/golden/block_demo.expected $(BUILD)/demo.actual
 

@@ -37,6 +37,9 @@ if(BUILD_TESTING)
   add_executable(eviction_tests tests/eviction_tests.cpp)
   target_link_libraries(eviction_tests PRIVATE kvcache_storage)
   add_test(NAME eviction_tests COMMAND eviction_tests)
+  add_executable(radix_fault_tests tests/radix_fault_tests.cpp)
+  target_link_libraries(radix_fault_tests PRIVATE kvcache_storage)
+  add_test(NAME radix_fault_tests COMMAND radix_fault_tests)
   add_test(NAME block_demo_golden COMMAND ${CMAKE_COMMAND}
     -DPROGRAM=$<TARGET_FILE:block_demo>
     -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/block_demo.in
