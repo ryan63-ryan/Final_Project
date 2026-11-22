@@ -58,6 +58,16 @@ $(BUILD)/manager_tests: tests/manager_tests.cpp $(MANAGER) $(CORE) $(HEADERS) | 
 manager-test: $(BUILD)/manager_tests
 	./$(BUILD)/manager_tests
 
+.PHONY: reference-test
+all: $(BUILD)/reference_tests
+test: reference-test
+
+$(BUILD)/reference_tests: tests/reference_tests.cpp tests/reference_cache.cpp tests/reference_cache.h src/trace.cpp $(MANAGER) $(CORE) $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $(MANAGER) src/trace.cpp tests/reference_cache.cpp tests/reference_tests.cpp -o $@
+
+reference-test: $(BUILD)/reference_tests
+	./$(BUILD)/reference_tests
+
 # Sources the kvcache driver needs besides main.cpp and $(CORE). The kvcache
 # recipe above compiles $(DRIVER); this line makes it rebuild when they change.
 DRIVER = src/trace.cpp $(MANAGER)
