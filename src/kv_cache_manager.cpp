@@ -359,6 +359,11 @@ bool KVCacheManager::check_invariants() const {
     // The policy's evictable set must be exactly the tree's evictable leaves. The
     // policy has no per-block query, so compare the sizes and the next victim.
     if (policy_->evictable_count() != evictable) return false;
+    // The tree's incremental count must agree with the pool (every held bit
+    // equals references > 1, which fails if a refresh was missed) and with the
+    // manager's own scan over all blocks. Checked whichever one admission uses.
+    if (!tree_.check_reclaimable()) return false;
+    if (tree_.reclaimable_count() != reclaimable_blocks()) return false;
     auto victim = policy_->victim();
     if (victim && !tree_.is_evictable(*victim)) return false;
     if (!config_.sharing) {
