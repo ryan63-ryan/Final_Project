@@ -1,0 +1,4 @@
+ADMIT r1 -> OK blocks=[0,1] cached=0
+FORK r2 r1 -> OK blocks=[0,1]
+APPEND r2 -> OK blocks=[0,2] cow=1
+RELEASE r1 -> OK freed=[1]

@@ -1,0 +1,13 @@
+ADMIT a -> OK blocks=[0] cached=0
+ADMIT b -> OK blocks=[1] cached=0
+ADMIT c -> OK blocks=[2] cached=0
+RELEASE a -> OK freed=[0]
+RELEASE b -> OK freed=[1]
+RELEASE c -> OK freed=[2]
+ADMIT d -> OK blocks=[2] cached=0
+RELEASE d -> OK freed=[2]
+ADMIT e -> OK blocks=[2,1] cached=0
+ADMIT f -> OK blocks=[0] cached=0
+RELEASE e -> OK freed=[2,1]
+ADMIT g -> OK blocks=[1,2,3] cached=0
+STATS admitted=7 rejected=0 errors=0 prompt_tokens=19 cached_tokens=0 uncached_tokens=19 cow=0 evictions=0 used=4 peak=4 fragmentation=1
