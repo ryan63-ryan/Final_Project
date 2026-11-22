@@ -105,13 +105,17 @@ def main():
             assert extended > len(admitted) // 2, extended
 
         # The driver replays it with per-operation invariant checks and no ERROR.
-        for sharing, capacity in (("on", 64), ("off", 64), ("on", 16)):
+        outputs = {}
+        for sharing, capacity, reclaimable in (("on", 64, "count"), ("off", 64, "count"),
+                                               ("on", 16, "count"), ("on", 16, "scan"),
+                                               ("on", 64, "scan")):
             with tempfile.TemporaryDirectory() as folder:
                 config = os.path.join(folder, "run.cfg")
                 trace = os.path.join(folder, "run.trace")
                 with open(config, "w") as out:
                     out.write("capacity=%d\ntokens_per_block=16\nbytes_per_token=8\n"
-                              "policy=lru\nsharing=%s\n" % (capacity, sharing))
+                              "policy=lru\nsharing=%s\nreclaimable=%s\n"
+                              % (capacity, sharing, reclaimable))
                 with open(trace, "w") as out:
                     out.write(text)
                 run = subprocess.run([kvcache, "--config", config, "--trace", trace],
@@ -121,6 +125,11 @@ def main():
             assert "ERROR" not in run.stdout, [l for l in run.stdout.splitlines()
                                                if "ERROR" in l][:3]
             assert run.stdout.splitlines()[-1].startswith("STATS admitted=")
+            outputs[(sharing, capacity, reclaimable)] = run.stdout
+        # reclaimable=scan and =count must print exactly the same thing.
+        for capacity in (16, 64):
+            assert outputs[("on", capacity, "count")] == outputs[("on", capacity, "scan")], \
+                "scan and count outputs differ at capacity %d" % capacity
         print("PASS %s traces: valid, deterministic, replayed by the driver" % mode)
 
     # Skewed modes: many system prompts, a few of them very popular.

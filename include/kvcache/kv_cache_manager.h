@@ -42,6 +42,11 @@ struct Stats {
     std::size_t used_blocks = 0;     // allocated blocks right now
     std::size_t peak_used_blocks = 0;
     std::size_t fragmentation_slots = 0; // empty token slots inside allocated blocks
+    // Full blocks that a request holds but the index does not: their prefix was
+    // already indexed with another block, so the same content is stored twice.
+    // Always 0 with sharing=off, where nothing is indexed and nothing compared.
+    std::size_t duplicate_blocks = 0;
+    std::size_t live_requests = 0;       // requests admitted or forked and not released
 };
 
 // Facade over the storage module: maps request IDs to block tables and turns
@@ -79,7 +84,7 @@ public:
     // ReferenceCache. Throws std::out_of_range for an unknown request.
     Payload read_request(const RequestId& id) const;
 
-    Stats stats() const; // O(capacity): scans the pool for fragmentation
+    Stats stats() const; // O(capacity): scans the pool for fragmentation and duplicates
     // Prefix-cache state, for tests and the demo.
     std::size_t indexed_blocks() const noexcept { return tree_.size(); }
     std::size_t evictable_blocks() const { return policy_->evictable_count(); }
@@ -102,12 +107,20 @@ private:
     // Puts every full block of `state` that the index does not cover yet into
     // the index and tells the policy. No-op when sharing=off.
     void index_full_blocks(const RequestState& state);
+    // RadixTree cannot see the pool, so after a request retains or releases
+    // blocks the manager reports each one: the tree re-reads its reference
+    // count and updates reclaimable_count(). Blocks that are not indexed are
+    // ignored by the tree. No-op when sharing=off (the index is empty).
+    void refresh_blocks(const std::vector<BlockId>& blocks);
     // Blocks that eviction could free right now: indexed blocks that no request
     // holds and none of whose descendants a request holds. Counts parents that
-    // only become leaves once their children are evicted. O(capacity).
+    // only become leaves once their children are evicted. Answered by the tree's
+    // count (O(1)) or by the scan below, as config.reclaimable says.
     std::size_t reclaimable_blocks() const;
-    // True if `needed` blocks are free or can be freed. Runs the O(capacity)
-    // scan only when the free list alone is not enough.
+    // The same number from a scan over every block ID. O(capacity).
+    std::size_t scan_reclaimable_blocks() const;
+    // True if `needed` blocks are free or can be freed. Asks for the reclaimable
+    // number only when the free list alone is not enough.
     bool has_room(std::size_t needed) const;
     // Evicts in policy order until `needed` blocks are free and records the
     // victims in `result`. Call only after has_room(needed) returned true.

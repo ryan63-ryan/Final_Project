@@ -58,6 +58,16 @@ $(BUILD)/manager_tests: tests/manager_tests.cpp $(MANAGER) $(CORE) $(HEADERS) | 
 manager-test: $(BUILD)/manager_tests
 	./$(BUILD)/manager_tests
 
+.PHONY: reference-test
+all: $(BUILD)/reference_tests
+test: reference-test
+
+$(BUILD)/reference_tests: tests/reference_tests.cpp tests/reference_cache.cpp tests/reference_cache.h src/trace.cpp $(MANAGER) $(CORE) $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CORE) $(MANAGER) src/trace.cpp tests/reference_cache.cpp tests/reference_tests.cpp -o $@
+
+reference-test: $(BUILD)/reference_tests
+	./$(BUILD)/reference_tests
+
 # Sources the kvcache driver needs besides main.cpp and $(CORE). The kvcache
 # recipe above compiles $(DRIVER); this line makes it rebuild when they change.
 DRIVER = src/trace.cpp $(MANAGER)
@@ -76,6 +86,16 @@ trace-test: $(BUILD)/kvcache
 	done
 	./$(BUILD)/kvcache --config tests/golden/example.cfg --trace tests/golden/fork_rejected.trace > $(BUILD)/fork_rejected.actual
 	diff -u tests/golden/fork_rejected.expected $(BUILD)/fork_rejected.actual
+# The same golden outputs, byte for byte, with reclaimable=scan (the configs
+# above use the default, count). Each entry is config:trace:expected.
+	for t in example:example:example eviction_lru:eviction:eviction_lru \
+	         eviction_fifo:eviction:eviction_fifo eviction_off:eviction:eviction_off \
+	         example:fork_rejected:fork_rejected; do \
+	  cfg=$${t%%:*}; rest=$${t#*:}; trace=$${rest%%:*}; expected=$${rest#*:}; \
+	  { cat tests/golden/$$cfg.cfg; echo; echo reclaimable=scan; } > $(BUILD)/scan.cfg && \
+	  ./$(BUILD)/kvcache --config $(BUILD)/scan.cfg --trace tests/golden/$$trace.trace > $(BUILD)/scan.actual && \
+	  diff -u tests/golden/$$expected.expected $(BUILD)/scan.actual || exit 1; \
+	done
 
 # --csv appends one row per run; needs CMake only as a script interpreter.
 .PHONY: csv-test

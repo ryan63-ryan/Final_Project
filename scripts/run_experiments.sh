@@ -5,6 +5,17 @@
 #   scripts/run_experiments.sh --quick         1k traces, 1 repetition (60 runs)
 #   scripts/run_experiments.sh --dry-run       print the plan and the time estimate only
 #   scripts/run_experiments.sh --sizes "1k 10k" --modes system --reps 3 --out results/raw/x.csv
+#   scripts/run_experiments.sh --reclaimable scan --out results/raw/scan_sweep.csv
+#
+# --reclaimable scan|count (default count) sets the config key of the same name:
+# how the manager counts the blocks eviction could free. Give a scan sweep a
+# file name that does not match results/raw/sweep*.csv, which plot.py pools.
+#
+# --sample-every N (default 0 = off) passes the driver's option of the same name:
+# the fragmentation and duplicate-block columns are means over samples taken
+# every N operations. Sampling scans the pool between operations, so do not use
+# such a run for latencies; counters are deterministic, so --reps 1 is enough:
+#   scripts/run_experiments.sh --reps 1 --sample-every 64 --out results/raw/fragmentation.csv
 #
 # Sweep: sharing {off,on} x policy {lru,fifo} x capacity {256,1024,4096} x
 # mode {unique,system,multiturn,skewed,skewed_short} x size {1k,10k,100k}, 5
@@ -24,6 +35,8 @@ CAPACITIES="256 1024 4096"
 MODES="unique system multiturn skewed skewed_short"
 SIZES="1k 10k 100k"
 REPS=5
+RECLAIMABLE=count           # count (tree's O(1) count) or scan (O(capacity) scan)
+SAMPLE_EVERY=0              # read the manager's statistics every n operations; 0 = never
 SEED=1                      # trace generator seed; the payload seed is fixed at 42
 OUT=results/raw/sweep.csv
 TRACE_DIR=traces
@@ -42,6 +55,8 @@ while [ $# -gt 0 ]; do
     --sizes)      SIZES=$2; shift 2 ;;
     --reps)       REPS=$2; shift 2 ;;
     --seed)       SEED=$2; shift 2 ;;
+    --reclaimable) RECLAIMABLE=$2; shift 2 ;;
+    --sample-every) SAMPLE_EVERY=$2; shift 2 ;;
     --out)        OUT=$2; shift 2 ;;
     --trace-dir)  TRACE_DIR=$2; shift 2 ;;
     --quick)      SIZES="1k"; REPS=1; shift ;;
@@ -66,7 +81,9 @@ for value in $SHARING;    do case $value in on|off) ;; *) echo "bad sharing '$va
 for value in $POLICIES;   do case $value in lru|fifo) ;; *) echo "bad policy '$value'" >&2; exit 2 ;; esac; done
 for value in $MODES;      do case $value in unique|system|multiturn|skewed|skewed_short) ;; *) echo "bad mode '$value'" >&2; exit 2 ;; esac; done
 for value in $CAPACITIES; do case $value in ''|*[!0-9]*) echo "bad capacity '$value'" >&2; exit 2 ;; esac; done
+case $RECLAIMABLE in scan|count) ;; *) echo "bad --reclaimable '$RECLAIMABLE' (use scan or count)" >&2; exit 2 ;; esac
 case $REPS in ''|*[!0-9]*|0) echo "bad --reps '$REPS'" >&2; exit 2 ;; esac
+case $SAMPLE_EVERY in ''|*[!0-9]*) echo "bad --sample-every '$SAMPLE_EVERY'" >&2; exit 2 ;; esac
 for size in $SIZES; do requests_of "$size" > /dev/null; done
 
 count() { echo $#; }
@@ -79,6 +96,7 @@ echo "Sweep: sharing {$SHARING} x policy {$POLICIES} x capacity {$CAPACITIES}"
 echo "       x mode {$MODES} x size {$SIZES} x $REPS repetitions = $total_runs runs"
 echo "Estimated time: about $(( estimate / 60 )) min $(( estimate % 60 )) s, plus trace generation"
 echo "                (roughly 5 s and 150 MB per 100k trace)."
+echo "Reclaimable blocks counted by: $RECLAIMABLE"
 echo "Output: $OUT"
 if [ "$DRY_RUN" = 1 ]; then exit 0; fi
 
@@ -117,6 +135,8 @@ meta="${OUT%.csv}.meta.txt"
   echo "flags: ${flags:-unknown}"
   echo "driver flags: --no-check, standard output to /dev/null"
   echo "tokens_per_block: 16, bytes_per_token: 64, payload seed: 42"
+  echo "reclaimable: $RECLAIMABLE"
+  echo "statistics sampled every: $SAMPLE_EVERY operations (0 = never)"
   echo "trace seed: $SEED, repetitions: $REPS"
   echo "sharing: $SHARING | policies: $POLICIES | capacities: $CAPACITIES"
   echo "modes: $MODES | sizes: $SIZES"
@@ -138,10 +158,10 @@ for rep in $(seq 1 "$REPS"); do
         for sharing in $SHARING; do
           for policy in $POLICIES; do
             config="$work/run.cfg"
-            printf 'capacity=%s\ntokens_per_block=16\nbytes_per_token=64\npolicy=%s\nsharing=%s\nseed=42\n' \
-              "$capacity" "$policy" "$sharing" > "$config"
+            printf 'capacity=%s\ntokens_per_block=16\nbytes_per_token=64\npolicy=%s\nsharing=%s\nreclaimable=%s\nseed=42\n' \
+              "$capacity" "$policy" "$sharing" "$RECLAIMABLE" > "$config"
             "./$BUILD/kvcache" --config "$config" --trace "$TRACE_DIR/${mode}_${size}.trace" \
-              --csv "$OUT" --no-check > /dev/null
+              --csv "$OUT" --no-check --sample-every "$SAMPLE_EVERY" > /dev/null
             done_runs=$(( done_runs + 1 ))
           done
         done

@@ -1,0 +1,28 @@
+date: 2026-11-22T18:53:51Z
+commit: b58a5d99c3df005973182843f69784d53bea516c
+system: Linux 6.6.87.2-microsoft-standard-WSL2 x86_64
+cpu: AMD Ryzen 7 9800X3D 8-Core Processor
+memory: 15943872 kB
+compiler: c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+flags: CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Wpedantic
+driver flags: --no-check, standard output to /dev/null
+tokens_per_block: 16, bytes_per_token: 64, payload seed: 42
+reclaimable: scan
+trace seed: 1, repetitions: 5
+sharing: off on | policies: lru fifo | capacities: 256 1024 4096
+modes: unique system multiturn skewed skewed_short | sizes: 1k 10k 100k
+trace unique_1k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=unique output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=1000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace system_1k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=system output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=1000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace multiturn_1k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=multiturn output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=1000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace skewed_1k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=1000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
+trace skewed_short_1k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed_short output_max=8 output_min=0 prompt_max=256 prompt_min=32 requests=1000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
+trace unique_10k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=unique output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=10000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace system_10k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=system output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=10000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace multiturn_10k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=multiturn output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=10000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace skewed_10k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=10000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
+trace skewed_short_10k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed_short output_max=8 output_min=0 prompt_max=256 prompt_min=32 requests=10000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
+trace unique_100k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=unique output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=100000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace system_100k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=system output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=100000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace multiturn_100k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=multiturn output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=100000 seed=1 system_len=128 system_prompts=4 turn_max=64 turn_min=16 vocab=32000
+trace skewed_100k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed output_max=64 output_min=8 prompt_max=256 prompt_min=32 requests=100000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
+trace skewed_short_100k: # gen_trace.py arrival=0.1 continue_chance=0.8 fork_fraction=0.02 max_active=32 mode=skewed_short output_max=8 output_min=0 prompt_max=256 prompt_min=32 requests=100000 seed=1 short_user_max=15 system_len=128 system_prompts=1024 turn_max=64 turn_min=16 vocab=32000 zipf=1.0
