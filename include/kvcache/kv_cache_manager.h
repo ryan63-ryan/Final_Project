@@ -42,6 +42,11 @@ struct Stats {
     std::size_t used_blocks = 0;     // allocated blocks right now
     std::size_t peak_used_blocks = 0;
     std::size_t fragmentation_slots = 0; // empty token slots inside allocated blocks
+    // Full blocks that a request holds but the index does not: their prefix was
+    // already indexed with another block, so the same content is stored twice.
+    // Always 0 with sharing=off, where nothing is indexed and nothing compared.
+    std::size_t duplicate_blocks = 0;
+    std::size_t live_requests = 0;       // requests admitted or forked and not released
 };
 
 // Facade over the storage module: maps request IDs to block tables and turns
@@ -79,7 +84,7 @@ public:
     // ReferenceCache. Throws std::out_of_range for an unknown request.
     Payload read_request(const RequestId& id) const;
 
-    Stats stats() const; // O(capacity): scans the pool for fragmentation
+    Stats stats() const; // O(capacity): scans the pool for fragmentation and duplicates
     // Prefix-cache state, for tests and the demo.
     std::size_t indexed_blocks() const noexcept { return tree_.size(); }
     std::size_t evictable_blocks() const { return policy_->evictable_count(); }

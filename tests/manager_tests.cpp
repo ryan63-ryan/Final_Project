@@ -86,6 +86,47 @@ Payload expected_bytes(const std::vector<Token>& tokens, std::uint64_t seed = 42
     return bytes;
 }
 
+// Storage waste reported by stats(): empty slots of partial tails, and full
+// blocks stored twice. Blocks hold 2 tokens.
+void waste_tests() {
+    KVCacheManager manager(small_config(true));
+    CHECK(manager.admit("r1", {1, 2, 3}).status == Status::Ok); // [1,2] full, [3,_] partial
+    Stats stats = manager.stats();
+    CHECK(stats.live_requests == 1 && stats.fragmentation_slots == 1);
+    CHECK(stats.duplicate_blocks == 0);
+    // A fork shares the partial tail: still one empty slot, counted once.
+    CHECK(manager.fork("r2", "r1").status == Status::Ok);
+    stats = manager.stats();
+    CHECK(stats.live_requests == 2 && stats.used_blocks == 2 && stats.fragmentation_slots == 1);
+    // r1 fills the shared tail through a private copy, which is indexed as
+    // [1,2,3,4]. r2 still holds the old tail: one empty slot again.
+    OpResult result = manager.append("r1", 4);
+    CHECK(result.status == Status::Ok && result.cow_copies == 1);
+    stats = manager.stats();
+    CHECK(stats.used_blocks == 3 && stats.fragmentation_slots == 1 && stats.duplicate_blocks == 0);
+    // r2 appends the same token in place. Its block is now full, but the prefix
+    // [1,2,3,4] is already indexed with r1's block, so r2's stays private: the
+    // same content is stored twice.
+    result = manager.append("r2", 4);
+    CHECK(result.status == Status::Ok && result.cow_copies == 0);
+    stats = manager.stats();
+    CHECK(stats.used_blocks == 3 && stats.fragmentation_slots == 0 && stats.duplicate_blocks == 1);
+    CHECK(manager.read_request("r1") == manager.read_request("r2"));
+    // Releasing r2 frees the duplicate; the indexed copy stays cached.
+    CHECK(manager.release("r2").freed.size() == 1);
+    stats = manager.stats();
+    CHECK(stats.live_requests == 1 && stats.used_blocks == 2 && stats.duplicate_blocks == 0);
+    CHECK(manager.check_invariants());
+
+    // sharing=off: nothing is indexed, so duplicates are not detected.
+    KVCacheManager baseline(small_config(false));
+    CHECK(baseline.admit("a", {1, 2, 3}).status == Status::Ok);
+    CHECK(baseline.admit("b", {1, 2, 3}).status == Status::Ok);
+    stats = baseline.stats();
+    CHECK(stats.live_requests == 2 && stats.fragmentation_slots == 2);
+    CHECK(stats.duplicate_blocks == 0);
+}
+
 // The proposal example (tests/golden/example.trace), checked step by step.
 void cow_tests() {
     KVCacheManager manager(small_config(true));
@@ -738,6 +779,7 @@ int main() {
                                                              : " [reclaimable=scan]\n";
             payload_tests(); std::cout << "PASS prefix-dependent payloads" << tag;
             cow_tests(); std::cout << "PASS proposal example, fork and copy-on-write" << tag;
+            waste_tests(); std::cout << "PASS fragmentation and duplicate blocks in stats" << tag;
             baseline_tests(); std::cout << "PASS sharing=off baseline" << tag;
             baseline_bypass_tests(); std::cout << "PASS sharing=off bypasses the prefix index" << tag;
             failure_tests(); std::cout << "PASS errors, rejects and moves leave state intact" << tag;

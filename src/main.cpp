@@ -1,6 +1,7 @@
 // kvcache: trace driver for the paged KV-cache manager.
 //
 //   kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check]
+//           [--sample-every <n>]
 //
 // Reads the trace one command per line, applies it to a KVCacheManager and
 // prints one result line per command, for example:
@@ -16,6 +17,11 @@
 // With --csv, one row describing the run (configuration, counters, latency per
 // operation type, total times, peak RSS) is appended to the file; the header
 // is written first if the file is new or empty.
+// With --sample-every n, the manager's statistics are read after every n-th
+// executed operation (outside the timed region) and the CSV row reports the
+// mean and the largest sampled fragmentation, the mean number of allocated
+// blocks, of duplicate blocks and of live requests. The statistics scan the
+// pool, so latency experiments leave sampling off (the default, n = 0).
 
 #include "kvcache/config.h"
 #include "kvcache/kv_cache_manager.h"
@@ -38,7 +44,8 @@ using namespace kvcache;
 namespace {
 
 const char* kUsage =
-    "usage: kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check]";
+    "usage: kvcache --config <cfg> --trace <trace> [--csv <out.csv>] [--no-check]"
+    " [--sample-every <n>]";
 
 using Clock = std::chrono::steady_clock;
 
@@ -52,6 +59,7 @@ struct Options {
     std::string trace_path;
     std::string csv_path; // empty = no CSV
     bool check = true;    // check_invariants after every operation
+    std::size_t sample_every = 0; // read stats() after every n-th operation; 0 = never
 };
 
 Options parse_arguments(int argc, char** argv) {
@@ -60,6 +68,15 @@ Options parse_arguments(int argc, char** argv) {
         std::string flag = argv[i];
         if (flag == "--no-check") {
             options.check = false;
+            continue;
+        }
+        if (flag == "--sample-every") {
+            if (i + 1 == argc) throw std::invalid_argument(kUsage);
+            std::string value = argv[++i];
+            if (value.empty() || value.size() > 9 ||
+                value.find_first_not_of("0123456789") != std::string::npos)
+                throw std::invalid_argument("--sample-every needs a number of operations");
+            options.sample_every = std::stoul(value);
             continue;
         }
         std::string* target = flag == "--config" ? &options.config_path
@@ -175,6 +192,22 @@ struct RunReport {
     std::size_t skipped_ops = 0; // commands skipped because their request was rejected
     std::array<LatencyHistogram, kOpCount> latency; // every executed operation
     std::uint64_t total_op_ns = 0;                  // sum of all timed manager calls
+    // Sums over the --sample-every samples of the manager's statistics.
+    std::uint64_t samples = 0;
+    std::uint64_t used_blocks_sum = 0;
+    std::uint64_t fragmentation_sum = 0;
+    std::uint64_t fragmentation_peak = 0;
+    std::uint64_t duplicate_blocks_sum = 0;
+    std::uint64_t live_requests_sum = 0;
+
+    std::uint64_t total_ops() const {
+        std::uint64_t total = 0;
+        for (const LatencyHistogram& histogram : latency) total += histogram.count();
+        return total;
+    }
+    double mean(std::uint64_t sum) const {
+        return samples == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(samples);
+    }
 };
 
 // Peak resident set size of this process in KiB, or 0 if it is not available.
@@ -212,7 +245,9 @@ void write_csv(const Options& options, const Config& config, const Stats& stats,
         for (const char* name : kOpNames)
             out << ',' << name << "_ops," << name << "_median_ns," << name << "_p99_ns,"
                 << name << "_mean_ns";
-        out << ",total_op_ns,total_driver_ns,peak_rss_kib,reclaimable\n";
+        out << ",total_op_ns,total_driver_ns,peak_rss_kib,reclaimable,stat_samples,"
+               "mean_used_blocks,mean_fragmentation_slots,peak_fragmentation_slots,"
+               "mean_duplicate_blocks,mean_live_requests\n";
     }
     out << config.capacity << ',' << config.tokens_per_block << ',' << config.bytes_per_token
         << ',' << (config.policy == PolicyKind::LRU ? "lru" : "fifo") << ','
@@ -227,11 +262,16 @@ void write_csv(const Options& options, const Config& config, const Stats& stats,
         out << ',' << latency.count() << ',' << latency.percentile(0.5) << ','
             << latency.percentile(0.99) << ',' << latency.mean();
     out << ',' << report.total_op_ns << ',' << total_driver_ns << ',' << peak_rss_kib() << ','
-        << (config.reclaimable == ReclaimableKind::Count ? "count" : "scan") << '\n';
+        << (config.reclaimable == ReclaimableKind::Count ? "count" : "scan") << ','
+        << report.samples << ',' << report.mean(report.used_blocks_sum) << ','
+        << report.mean(report.fragmentation_sum) << ',' << report.fragmentation_peak << ','
+        << report.mean(report.duplicate_blocks_sum) << ','
+        << report.mean(report.live_requests_sum) << '\n';
     if (!out) throw std::runtime_error("cannot write csv file '" + path + "'");
 }
 
-RunReport run_trace(std::istream& trace, KVCacheManager& manager, bool check) {
+RunReport run_trace(std::istream& trace, KVCacheManager& manager, bool check,
+                    std::size_t sample_every) {
     // Proposal rule: once a request is rejected at creation (ADMIT, or FORK as
     // the new request), every later command that names it is skipped.
     std::unordered_set<RequestId> rejected;
@@ -309,6 +349,16 @@ RunReport run_trace(std::istream& trace, KVCacheManager& manager, bool check) {
         print_result(std::cout, label, command.type, result);
         bool creates = command.type == CommandType::Admit || command.type == CommandType::Fork;
         if (creates && result.status == Status::Reject) rejected.insert(command.req);
+        if (sample_every != 0 && (report.total_ops() % sample_every) == 0) {
+            Stats now = manager.stats();
+            ++report.samples;
+            report.used_blocks_sum += now.used_blocks;
+            report.fragmentation_sum += now.fragmentation_slots;
+            if (now.fragmentation_slots > report.fragmentation_peak)
+                report.fragmentation_peak = now.fragmentation_slots;
+            report.duplicate_blocks_sum += now.duplicate_blocks;
+            report.live_requests_sum += now.live_requests;
+        }
     }
     return report;
 }
@@ -326,7 +376,7 @@ int main(int argc, char** argv) {
         // including parsing, printing and per-operation checks.
         auto start = Clock::now();
         KVCacheManager manager(config);
-        RunReport report = run_trace(trace, manager, options.check);
+        RunReport report = run_trace(trace, manager, options.check, options.sample_every);
         auto total_driver_ns = nanoseconds(Clock::now() - start);
         if (!manager.check_invariants()) throw std::logic_error("manager invariants violated");
         if (!options.csv_path.empty())

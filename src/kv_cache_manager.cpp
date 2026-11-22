@@ -332,9 +332,12 @@ std::size_t KVCacheManager::block_references(BlockId block) const {
 Stats KVCacheManager::stats() const {
     Stats stats = stats_;
     stats.used_blocks = pool_->capacity() - pool_->free_count();
-    for (BlockId id = 0; id < pool_->capacity(); ++id)
-        if (pool_->allocated(id))
-            stats.fragmentation_slots += pool_->tokens_per_block() - pool_->used_tokens(id);
+    stats.live_requests = requests_.size();
+    for (BlockId id = 0; id < pool_->capacity(); ++id) {
+        if (!pool_->allocated(id)) continue;
+        stats.fragmentation_slots += pool_->tokens_per_block() - pool_->used_tokens(id);
+        if (config_.sharing && pool_->full(id) && !tree_.contains(id)) ++stats.duplicate_blocks;
+    }
     return stats;
 }
 
