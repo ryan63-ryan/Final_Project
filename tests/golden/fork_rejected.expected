@@ -1,0 +1,5 @@
+ADMIT big -> OK blocks=[0,1,2,3] cached=0
+ADMIT r1 -> REJECT needs 3 blocks, 0 free, 0 evictable
+ADMIT r2 -> REJECT needs 2 blocks, 0 free, 0 evictable
+RELEASE big -> OK freed=[]
+STATS admitted=1 rejected=2 errors=0 prompt_tokens=8 cached_tokens=0 uncached_tokens=8 cow=0 evictions=0 used=4 peak=4 fragmentation=0
