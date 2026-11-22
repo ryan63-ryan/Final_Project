@@ -232,9 +232,9 @@ What we found (100k requests):
   about equal for the shared system prompt, faster when most requests are full cache
   hits, and slowest for unique prompts, where sharing can't help. The p99 is always
   higher with sharing (1.05x to 2.2x). FORK is 5x to 11x faster.
-- The O(1) reclaimable count matters: with the O(capacity) scan the ADMIT median was
-  1.1x to 5.0x higher and grew with capacity (for multi-turn at 4096 blocks, 21.4 us
-  against 4.3 us). Both versions make exactly the same decisions.
+- The O(1) reclaimable count made a big difference. With the O(capacity) scan the ADMIT
+  median was 1.1x to 5.0x higher and it grew with capacity (multi-turn at 4096 blocks:
+  21.4 us with the scan, 4.3 us with the count). Both make exactly the same decisions.
 - LRU and FIFO evict almost exactly the same blocks in most workloads. They only differ
   when a cached prefix gets reused without anything new being added under it. In that
   workload LRU's hit rate is 2 to 3 points higher.
@@ -257,12 +257,12 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 |---|---|---|
 | Substantive custom work | Blocks are shared by requests, by forks and by the cache at the same time, and the pool has a fixed size. The pool, tables, index, policies and manager all have to agree on the reference counts | `src/`, `docs/integration_notes.md` |
 | Operational completeness | Full request lifecycle (ADMIT, APPEND, FORK, RELEASE), admission check, eviction with cascade, rejects that change nothing | `src/kv_cache_manager.cpp`, `src/main.cpp`, `tests/golden/` |
-| Inspectable design choice | Three choices you can switch in the config and compare on the same traces and capacity: no sharing vs prefix sharing (`sharing`), LRU vs FIFO (`policy`), and O(capacity) scan vs O(1) incremental count for the reclaimable blocks (`reclaimable`). The last one changes no output, only time: the ADMIT median is 1.1x to 5.0x lower with the count | `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sec. 4-6, `results/figures/report/admit_latency_vs_capacity.png` |
+| Inspectable design choice | Three things can be switched in the config and compared on the same traces: sharing off vs on (`sharing`), LRU vs FIFO (`policy`), and how we count reclaimable blocks, O(capacity) scan vs O(1) count (`reclaimable`). The third one doesn't change any output, only the time: ADMIT median is 1.1x to 5.0x lower with the count | `tests/golden/eviction_{lru,fifo,off}.*`, `docs/experiment_notes.md` sec. 4-6, `results/figures/report/admit_latency_vs_capacity.png` |
 | Meaningful evaluation | 5 workloads, 3 capacities, 3 sizes. Includes cases where sharing is slower or useless | `docs/experiment_notes.md`, `results/` |
 | Feasible boundaries | Ours: everything in `src/` and `include/`. Reused: STL, Python/matplotlib for scripts. Not done on purpose: GPU, real model, threads, distributed | [Known limitations](#known-limitations), proposal sec. 3 |
 | I/O and state contract | Trace commands in, one result line out. Every command either fully happens or changes nothing | [Run](#run), `include/kvcache/kv_cache_manager.h` |
 | Driver on the real implementation | `kvcache` replays a trace on the actual manager and buffers | `src/main.cpp` |
-| Independent reference | `ReferenceCache` is a separate simple implementation (vectors, maps, linear scans) that predicts bytes, prefix hits, capacity decisions and evictions; the real manager is compared with it step by step. The manager tests also recompute each request's bytes from its tokens only | `tests/reference_cache.*`, `tests/reference_tests.cpp`, `docs/reference_tests.md`, `tests/manager_tests.cpp` |
+| Independent reference | `ReferenceCache` is a second, much simpler implementation (vectors, maps, linear scans). It predicts the bytes, prefix hits, admit/reject and evictions, and the test compares the real manager with it after every step. The manager tests also recompute each request's bytes from its tokens only | `tests/reference_cache.*`, `tests/reference_tests.cpp`, `docs/reference_tests.md`, `tests/manager_tests.cpp` |
 | Documented harness instead of a model | Fake payload bytes from the token prefix, synthetic traces | `include/kvcache/kv_cache_manager.h`, `scripts/gen_trace.py` |
 
 ### KV-cache module contract (from the assignment's example)
@@ -300,7 +300,7 @@ This follows the Phase II sections of the assignment. Paths are from the repo ro
 | Data structure 3 | Block pool with free list and reference counts | `src/block_pool.cpp` |
 | Algorithm 1 | Longest-prefix match with edge splits | `RadixTree::match`, `split_insert` in `src/radix_tree.cpp` |
 | Algorithm 2 | Copy-on-write with reference counting | `BlockTable::append` in `src/block_table.cpp` |
-| Algorithm 3 | Greedy leaf eviction with cascade, plus counting how many blocks can be reclaimed. The count is kept incrementally in the tree (a block is "stuck" if it or something below it is in use, and changes are pushed up to the ancestors); the old full scan is kept as a check | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_count`, `refresh` in `src/radix_tree.cpp`; `reclaimable_blocks`, `make_room` in `src/kv_cache_manager.cpp` |
+| Algorithm 3 | Greedy leaf eviction with cascade, plus counting how many blocks can be reclaimed. The tree keeps this count up to date itself: a block is "stuck" if it or something below it is in use, and a change is passed up to its ancestors. The old full scan is still there as a check | `evict_one` in `src/eviction_policy.cpp`; `reclaimable_count`, `refresh` in `src/radix_tree.cpp`; `reclaimable_blocks`, `make_room` in `src/kv_cache_manager.cpp` |
 | How they work together | One ADMIT uses all of them: the tree finds the prefix, reference counts tell which cached blocks are unused, the heap orders them, eviction removes leaves from the tree, and the freed blocks are written and indexed | `KVCacheManager::admit` |
 | Radix compression (proposal sec. 4) | An edge stores a run of full blocks and their tokens. Edges are extended, split and shortened only at block boundaries | `src/radix_tree.cpp`, `docs/radix_and_eviction.md` |
 
