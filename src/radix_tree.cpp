@@ -24,7 +24,7 @@ RadixTree::~RadixTree() { release_all(); }
 
 RadixTree::RadixTree(RadixTree&& other) noexcept
     : pool_(other.pool_), root_(std::move(other.root_)),
-      nodes_(std::exchange(other.nodes_, 0)) {
+      nodes_(std::exchange(other.nodes_, 0)), stuck_(std::exchange(other.stuck_, 0)) {
     index_.swap(other.index_);
 }
 
@@ -35,6 +35,7 @@ RadixTree& RadixTree::operator=(RadixTree&& other) noexcept {
         root_.swap(other.root_);
         index_.swap(other.index_);
         std::swap(nodes_, other.nodes_);
+        std::swap(stuck_, other.stuck_);
     }
     return *this;
 }
@@ -44,7 +45,9 @@ void RadixTree::release_all() noexcept {
     for (const auto& entry : index_) pool_->release(entry.first);
     index_.clear();
     root_->children.clear();
+    root_->stuck_children = 0;
     nodes_ = 0;
+    stuck_ = 0;
 }
 
 std::vector<BlockId> RadixTree::match(const std::vector<Token>& tokens) const {
@@ -128,6 +131,7 @@ void RadixTree::extend(Node* node, const Token* chunk, BlockId block) {
     const auto width = pool_->tokens_per_block();
     reserve_more(node->tokens, width);
     reserve_more(node->blocks, 1);
+    reserve_more(node->held, 1);
     pool_->retain(block);
     try {
         index_.emplace(block, Slot{node, node->blocks.size()}); // allocates; may throw
@@ -136,8 +140,14 @@ void RadixTree::extend(Node* node, const Token* chunk, BlockId block) {
         throw;
     }
     // Capacity is reserved: these cannot throw.
+    const auto before = stuck_blocks(*node);
+    const bool was = is_stuck(*node);
     node->tokens.insert(node->tokens.end(), chunk, chunk + width);
     node->blocks.push_back(block);
+    const bool held = pool_->references(block) > 1;
+    node->held.push_back(held);
+    if (held) node->held_top = node->blocks.size();
+    settle(node, before, was); // childless: only held_top counts
 }
 
 // Adds a one-block edge below the end of `node`'s edge (or below the root).
@@ -147,6 +157,7 @@ void RadixTree::add_child(Node* node, const Token* chunk, BlockId block) {
     child->parent = node;
     child->tokens.assign(chunk, chunk + width);
     child->blocks.push_back(block);
+    child->held.push_back(0); // set below, once the block is retained
     std::vector<Token> key(chunk, chunk + width);
     Node* raw = child.get();
     pool_->retain(block);
@@ -162,6 +173,11 @@ void RadixTree::add_child(Node* node, const Token* chunk, BlockId block) {
         throw;
     }
     ++nodes_;
+    if (pool_->references(block) > 1) {
+        raw->held[0] = 1;
+        raw->held_top = 1;
+        settle(raw, 0, false); // the new edge is stuck; so are its ancestors
+    }
 }
 
 // Splits `node`'s edge after its first `keep` blocks (0 < keep < size) and adds
@@ -177,10 +193,12 @@ void RadixTree::split_insert(Node* node, std::size_t keep, const Token* chunk, B
     tail->tokens.assign(cut, node->tokens.end());
     tail->blocks.assign(node->blocks.begin() + static_cast<std::ptrdiff_t>(keep),
                         node->blocks.end());
+    tail->held.assign(node->held.begin() + static_cast<std::ptrdiff_t>(keep), node->held.end());
     auto leaf = std::make_unique<Node>();
     leaf->parent = node;
     leaf->tokens.assign(chunk, chunk + width);
     leaf->blocks.push_back(block);
+    leaf->held.push_back(0); // set below, once the block is retained
     Node* tail_raw = tail.get();
     Node* leaf_raw = leaf.get();
     Children fresh;
@@ -196,6 +214,8 @@ void RadixTree::split_insert(Node* node, std::size_t keep, const Token* chunk, B
     }
 
     // Commit: nothing below allocates or throws.
+    const auto before = stuck_blocks(*node);
+    const bool was = is_stuck(*node);
     tail_raw->children.swap(node->children); // swap keeps the children's iterators valid
     for (auto& entry : tail_raw->children) entry.second->parent = tail_raw;
     for (std::size_t i = 0; i < tail_raw->blocks.size(); ++i)
@@ -206,6 +226,55 @@ void RadixTree::split_insert(Node* node, std::size_t keep, const Token* chunk, B
     tail_raw->self = tail_it;
     leaf_raw->self = leaf_it;
     nodes_ += 2;
+
+    // Reclaimable bookkeeping: the tail takes the stuck children and the held
+    // blocks past the cut; the node keeps the rest and gets {tail, leaf}.
+    tail_raw->stuck_children = node->stuck_children;
+    tail_raw->held_top = node->held_top > keep ? node->held_top - keep : 0;
+    node->held.erase(node->held.begin() + static_cast<std::ptrdiff_t>(keep), node->held.end());
+    node->held_top = std::min(node->held_top, keep);
+    lower_top(*node);
+    if (pool_->references(block) > 1) {
+        leaf_raw->held[0] = 1;
+        leaf_raw->held_top = 1;
+    }
+    node->stuck_children = (is_stuck(*tail_raw) ? 1 : 0) + (is_stuck(*leaf_raw) ? 1 : 0);
+    stuck_ += stuck_blocks(*tail_raw) + stuck_blocks(*leaf_raw); // new edges
+    settle(node, before, was); // replaces node's old count (it covered the tail)
+}
+
+void RadixTree::lower_top(Node& node) noexcept {
+    while (node.held_top > 0 && !node.held[node.held_top - 1]) --node.held_top;
+}
+
+void RadixTree::settle(Node* node, std::size_t before, bool was) noexcept {
+    for (;;) {
+        stuck_ = stuck_ - before + stuck_blocks(*node);
+        const bool now = is_stuck(*node);
+        Node* up = node->parent;
+        if (now == was || up == root_.get()) return;
+        // node's first block flipped, so up's last block may flip too.
+        before = stuck_blocks(*up);
+        was = is_stuck(*up);
+        if (now) ++up->stuck_children;
+        else --up->stuck_children;
+        node = up;
+    }
+}
+
+void RadixTree::refresh(BlockId block) {
+    auto it = index_.find(block);
+    if (it == index_.end()) return;
+    Node* node = it->second.node;
+    const auto offset = it->second.offset;
+    const bool held = pool_->references(block) > 1;
+    if (static_cast<bool>(node->held[offset]) == held) return;
+    const auto before = stuck_blocks(*node);
+    const bool was = is_stuck(*node);
+    node->held[offset] = held;
+    if (held) node->held_top = std::max(node->held_top, offset + 1);
+    else lower_top(*node);
+    settle(node, before, was);
 }
 
 bool RadixTree::erase(BlockId block) {
@@ -213,13 +282,24 @@ bool RadixTree::erase(BlockId block) {
     if (it == index_.end()) return false;
     Node* node = it->second.node;
     if (it->second.offset + 1 != node->blocks.size() || !node->children.empty()) return false;
+    const auto offset = it->second.offset;
     index_.erase(it);
+    // Un-stick the block first (the edge is childless, so only held bits count),
+    // so stuck_ and the ancestors' stuck_children no longer include it.
+    if (node->held[offset]) {
+        const auto before = stuck_blocks(*node);
+        const bool was = is_stuck(*node);
+        node->held[offset] = 0;
+        lower_top(*node);
+        settle(node, before, was);
+    }
     if (node->blocks.size() == 1) {
         node->parent->children.erase(node->self); // destroys node
         --nodes_;
     } else {
         // Drop the last block of the edge; no merge with a single remaining child.
         node->blocks.pop_back();
+        node->held.pop_back();
         node->tokens.resize(node->tokens.size() - pool_->tokens_per_block());
     }
     pool_->release(block);
@@ -248,8 +328,10 @@ std::optional<BlockId> RadixTree::parent(BlockId block) const {
     return node->parent->blocks.back();
 }
 
-bool RadixTree::check_node(const Node& node, std::size_t& blocks, std::size_t& nodes) const {
+bool RadixTree::check_node(const Node& node, std::size_t& blocks, std::size_t& nodes,
+                           std::size_t& stuck) const {
     const auto width = pool_->tokens_per_block();
+    std::size_t stuck_children = 0;
     for (const auto& entry : node.children) {
         const Node& child = *entry.second;
         if (child.parent != &node || child.self->second.get() != &child) return false;
@@ -266,17 +348,58 @@ bool RadixTree::check_node(const Node& node, std::size_t& blocks, std::size_t& n
                 return false;
             ++blocks;
         }
+        // Reclaimable bookkeeping, against the recorded held bits.
+        if (child.held.size() != child.blocks.size() || child.held_top > child.held.size())
+            return false;
+        for (std::size_t i = 0; i < child.held.size(); ++i)
+            if (child.held[i] > 1 || (i >= child.held_top && child.held[i])) return false;
+        if (child.held_top > 0 && !child.held[child.held_top - 1]) return false;
         ++nodes;
-        if (!check_node(child, blocks, nodes)) return false;
+        if (!check_node(child, blocks, nodes, stuck)) return false;
+        stuck += stuck_blocks(child);
+        if (is_stuck(child)) ++stuck_children;
     }
-    return true;
+    // The root has no blocks to stick, so its counter is never maintained.
+    return &node == root_.get() || node.stuck_children == stuck_children;
 }
 
 bool RadixTree::check_invariants() const {
-    if (!root_ || root_->parent != nullptr || !root_->blocks.empty() || !root_->tokens.empty())
+    if (!root_ || root_->parent != nullptr || !root_->blocks.empty() || !root_->tokens.empty() ||
+        !root_->held.empty() || root_->held_top != 0 || root_->stuck_children != 0)
         return false;
-    std::size_t blocks = 0, nodes = 0;
-    return check_node(*root_, blocks, nodes) && blocks == index_.size() && nodes == nodes_;
+    std::size_t blocks = 0, nodes = 0, stuck = 0;
+    return check_node(*root_, blocks, nodes, stuck) && blocks == index_.size() &&
+           nodes == nodes_ && stuck == stuck_;
+}
+
+// Recomputes, from the pool alone, how many blocks under `node` are stuck, and
+// whether `node`'s first block is; also compares each recorded held bit.
+bool RadixTree::recount(const Node& node, std::size_t& stuck, bool& node_stuck) const {
+    bool child_stuck = false;
+    for (const auto& entry : node.children) {
+        bool s = false;
+        if (!recount(*entry.second, stuck, s)) return false;
+        child_stuck = child_stuck || s;
+    }
+    std::size_t top = 0; // last held block + 1, per the pool
+    for (std::size_t i = 0; i < node.blocks.size(); ++i) {
+        const bool held = pool_->references(node.blocks[i]) > 1;
+        if (held != static_cast<bool>(node.held[i])) return false;
+        if (held) top = i + 1;
+    }
+    const auto count = child_stuck ? node.blocks.size() : top;
+    stuck += count;
+    node_stuck = count > 0;
+    return true;
+}
+
+bool RadixTree::check_reclaimable() const {
+    if (!check_invariants()) return false;
+    std::size_t stuck = 0;
+    bool unused = false;
+    for (const auto& entry : root_->children)
+        if (!recount(*entry.second, stuck, unused)) return false;
+    return index_.size() - stuck == reclaimable_count();
 }
 
 } // namespace kvcache

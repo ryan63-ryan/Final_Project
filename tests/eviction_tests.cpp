@@ -50,6 +50,7 @@ BlockId cache_block(BlockPool& pool, RadixTree& tree, EvictionPolicy& policy,
     CHECK(tree.insert(prefix, id));
     policy.on_insert(id);
     pool.release(id);
+    tree.refresh(id);
     policy.set_evictable(id, tree.is_evictable(id));
     if (auto parent = tree.parent(id)) policy.set_evictable(*parent, tree.is_evictable(*parent));
     return id;
@@ -60,6 +61,7 @@ BlockTable hit(BlockPool& pool, RadixTree& tree, EvictionPolicy& policy, const T
     auto ids = tree.match(tokens);
     auto table = BlockTable::from_prefix(pool, ids);
     for (BlockId id : ids) {
+        tree.refresh(id);
         policy.on_access(id);
         policy.set_evictable(id, tree.is_evictable(id));
     }
@@ -70,8 +72,10 @@ BlockTable hit(BlockPool& pool, RadixTree& tree, EvictionPolicy& policy, const T
 void finish(BlockTable& table, RadixTree& tree, EvictionPolicy& policy) {
     auto ids = table.blocks();
     table.clear();
-    for (BlockId id : ids)
+    for (BlockId id : ids) {
+        tree.refresh(id);
         if (tree.contains(id)) policy.set_evictable(id, tree.is_evictable(id));
+    }
 }
 
 Ids drain(RadixTree& tree, EvictionPolicy& policy) {
@@ -192,21 +196,42 @@ void parent_recheck() {
     }
 }
 
+// The scan KVCacheManager::reclaimable_blocks() uses: size() minus the held
+// indexed blocks and their ancestors.
+std::size_t scan_reclaimable(const BlockPool& pool, const RadixTree& tree) {
+    std::vector<bool> stuck(pool.capacity(), false);
+    std::size_t stuck_count = 0;
+    for (BlockId id = 0; id < pool.capacity(); ++id) {
+        if (!tree.contains(id) || pool.references(id) == 1) continue;
+        for (std::optional<BlockId> block = id; block && !stuck[*block]; block = tree.parent(*block)) {
+            stuck[*block] = true;
+            ++stuck_count;
+        }
+    }
+    return tree.size() - stuck_count;
+}
+
 // Evicts until nothing is evictable. Each evict_one call must remove exactly one
 // physical block, and afterwards the policy's evictable set must match the tree
-// (this is where a missed parent re-check would show).
+// (this is where a missed parent re-check would show). The reclaimable count
+// drops by exactly one per eviction, and the loop evicts exactly that many.
 Ids drain_checked(BlockPool& pool, RadixTree& tree, EvictionPolicy& policy, const Ids& all) {
     Ids order;
+    const auto reclaimable = tree.reclaimable_count();
     for (;;) {
         auto size = tree.size();
         auto free = pool.free_count();
+        auto count = tree.reclaimable_count();
+        CHECK(tree.check_reclaimable() && (count > 0) == (policy.evictable_count() > 0));
         auto id = evict_one(tree, policy);
         if (!id) {
             CHECK(tree.size() == size && pool.free_count() == free);
+            CHECK(count == 0 && order.size() == reclaimable);
             return order;
         }
         order.push_back(*id);
         CHECK(tree.size() == size - 1 && pool.free_count() == free + 1 && !tree.contains(*id));
+        CHECK(tree.reclaimable_count() == count - 1);
         std::size_t evictable = 0;
         for (BlockId block : all) evictable += tree.is_evictable(block) ? 1 : 0;
         CHECK(policy.evictable_count() == evictable);
@@ -388,12 +413,22 @@ void random_tests(unsigned seed, std::size_t steps, bool lru) {
             CHECK(policy.victim() == model.first);
             CHECK(policy.evictable_count() == model.second);
             CHECK(tree.size() == prefixes.size());
+            CHECK(tree.reclaimable_count() == scan_reclaimable(pool, tree));
+            CHECK((tree.reclaimable_count() > 0) == (model.second > 0));
             if (step % 101 == 0)
                 CHECK(policy.check_invariants() && tree.check_invariants() && pool.check_invariants());
         }
         CHECK(evictions > 0 && starved > 0 && promoted > 0 && hits > 0);
+        // Cascade from the final state, requests still pinned: evict_one succeeds
+        // exactly reclaimable_count() times, one block fewer each time.
+        Ids all;
+        for (const auto& entry : prefixes) all.push_back(entry.second);
+        const auto reclaimable = tree.reclaimable_count();
+        CHECK(drain_checked(pool, tree, policy, all).size() == reclaimable);
+        CHECK(tree.size() == prefixes.size() - reclaimable);
         for (auto& request : requests) finish(*request, tree, policy);
-        CHECK(drain(tree, policy).size() == prefixes.size() && tree.size() == 0);
+        CHECK(tree.reclaimable_count() == tree.size()); // nothing held any more
+        CHECK(drain(tree, policy).size() == prefixes.size() - reclaimable && tree.size() == 0);
     }
     CHECK(pool.free_count() == pool.capacity());
 }
@@ -418,7 +453,8 @@ int main() {
             random_tests<LRUPolicy>(seed, 6000, true);
             random_tests<FIFOPolicy>(seed, 6000, false);
         }
-        std::cout << "PASS 36000 seeded LRU/FIFO operations against a scan-based model\n";
+        std::cout << "PASS 36000 seeded LRU/FIFO operations against a scan-based model;\n"
+                     "     reclaimable count equals the scan, and each cascade evicts exactly that many\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

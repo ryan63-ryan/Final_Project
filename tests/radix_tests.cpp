@@ -5,6 +5,8 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -140,8 +142,44 @@ BlockId cache(BlockPool& pool, RadixTree& tree, const Tokens& prefix) {
     BlockId id = make_block(pool, pool.tokens_per_block());
     CHECK(tree.insert(prefix, id));
     pool.release(id);
+    tree.refresh(id);
     return id;
 }
+
+// Independent oracle, the scan KVCacheManager::reclaimable_blocks() uses: mark
+// every held indexed block and its ancestors via parent(). Uses only the public
+// per-block API and the pool. Returns the marked (stuck) set.
+std::vector<bool> scan_stuck(const BlockPool& pool, const RadixTree& tree) {
+    std::vector<bool> stuck(pool.capacity(), false);
+    for (BlockId id = 0; id < pool.capacity(); ++id) {
+        if (!tree.contains(id) || pool.references(id) == 1) continue;
+        for (std::optional<BlockId> block = id; block && !stuck[*block]; block = tree.parent(*block))
+            stuck[*block] = true;
+    }
+    return stuck;
+}
+
+// The incremental count agrees with the scan and with the tree's own recount;
+// every evictable block is reclaimable, and some block is evictable exactly
+// when something is reclaimable.
+std::size_t reclaimable(const BlockPool& pool, const RadixTree& tree) {
+    auto stuck = scan_stuck(pool, tree);
+    auto count = tree.reclaimable_count();
+    CHECK(count == tree.size() - static_cast<std::size_t>(std::count(stuck.begin(), stuck.end(), true)));
+    CHECK(tree.check_invariants() && tree.check_reclaimable());
+    bool any_evictable = false;
+    for (BlockId id = 0; id < pool.capacity(); ++id) {
+        if (!tree.is_evictable(id)) continue;
+        CHECK(!stuck[id]);
+        any_evictable = true;
+    }
+    CHECK(any_evictable == (count > 0));
+    return count;
+}
+
+// A request holds (or lets go of) a single indexed block, then tells the tree.
+void hold(BlockPool& pool, RadixTree& tree, BlockId id) { pool.retain(id); tree.refresh(id); }
+void drop(BlockPool& pool, RadixTree& tree, BlockId id) { pool.release(id); tree.refresh(id); }
 
 void compression_tests() {
     BlockPool pool(12, 2, 1);
@@ -249,7 +287,159 @@ void split_ownership_tests() {
     CHECK(pool.free_count() == pool.capacity());
 }
 
-// Seeded operations against a map from indexed prefix to block.
+#define RECLAIMABLE(n) CHECK(reclaimable(pool, tree) == (n))
+
+// Hand cases for reclaimable_count(). Each step is also checked against the scan.
+void reclaimable_tests() {
+    {
+        // One compressed edge [A|B|C]: holds in the middle of the edge.
+        BlockPool pool(8, 2, 1);
+        RadixTree tree(pool);
+        RECLAIMABLE(0);
+        BlockId a = cache(pool, tree, {1, 1});
+        BlockId b = cache(pool, tree, {1, 1, 2, 2});
+        BlockId c = cache(pool, tree, {1, 1, 2, 2, 3, 3});
+        CHECK(tree.node_count() == 1);
+        RECLAIMABLE(3);
+        hold(pool, tree, c); RECLAIMABLE(0);
+        drop(pool, tree, c); hold(pool, tree, b); RECLAIMABLE(1); // C
+        drop(pool, tree, b); hold(pool, tree, a); RECLAIMABLE(2); // B, C
+        drop(pool, tree, a); RECLAIMABLE(3);
+        // Two held blocks on the edge, released top first and bottom first.
+        hold(pool, tree, b); hold(pool, tree, c); RECLAIMABLE(0);
+        drop(pool, tree, c); RECLAIMABLE(1);
+        drop(pool, tree, b); RECLAIMABLE(3);
+        hold(pool, tree, b); hold(pool, tree, c);
+        drop(pool, tree, b); RECLAIMABLE(0); // C still holds A and B
+        drop(pool, tree, c); RECLAIMABLE(3);
+        // Two requests on B: the first release changes nothing.
+        hold(pool, tree, b); hold(pool, tree, b); RECLAIMABLE(1);
+        drop(pool, tree, b); RECLAIMABLE(1);
+        drop(pool, tree, b); RECLAIMABLE(3);
+        // refresh without a change, or of a block that is not indexed, is a no-op.
+        tree.refresh(a);
+        BlockId loose = make_block(pool, 2);
+        tree.refresh(loose);
+        RECLAIMABLE(3);
+        pool.release(loose);
+        // Leaves go one block at a time: each erase of a reclaimable leaf removes 1.
+        hold(pool, tree, a);
+        CHECK(tree.erase(c)); RECLAIMABLE(1);
+        CHECK(tree.erase(b)); RECLAIMABLE(0);
+        drop(pool, tree, a); RECLAIMABLE(1);
+    }
+    {
+        // Branch [A] -> {[B], [C]}: hold B, evict C, release B.
+        BlockPool pool(8, 2, 1);
+        RadixTree tree(pool);
+        BlockId a = cache(pool, tree, {1, 1});
+        BlockId b = cache(pool, tree, {1, 1, 2, 2});
+        BlockId c = cache(pool, tree, {1, 1, 3, 3});
+        CHECK(tree.node_count() == 3 && tree.parent(b) == a && tree.parent(c) == a);
+        RECLAIMABLE(3);
+        hold(pool, tree, b); RECLAIMABLE(1);
+        CHECK(tree.is_evictable(c) && tree.erase(c)); RECLAIMABLE(0);
+        drop(pool, tree, b); RECLAIMABLE(2);
+    }
+    {
+        // Inserting a held block (its request still owns it) below cached blocks.
+        BlockPool pool(8, 2, 1);
+        RadixTree tree(pool);
+        BlockId a = cache(pool, tree, {1, 1});
+        RECLAIMABLE(1);
+        BlockId b = make_block(pool, 2);
+        CHECK(tree.insert({1, 1, 2, 2}, b) && tree.node_count() == 1); // extends [A|B]
+        RECLAIMABLE(0);
+        BlockId c = make_block(pool, 2);
+        CHECK(tree.insert({1, 1, 5, 5}, c) && tree.node_count() == 3); // splits after A
+        RECLAIMABLE(0);
+        drop(pool, tree, b); RECLAIMABLE(1); // B; C holds A
+        // Erasing a held leaf: its cached parent becomes reclaimable.
+        CHECK(tree.erase(c) && pool.references(c) == 1); RECLAIMABLE(2);
+        pool.release(c);
+        tree.refresh(c); // no longer indexed: no-op
+        // A held block as a new edge below an edge that has children.
+        BlockId d = make_block(pool, 2);
+        CHECK(tree.insert({1, 1, 6, 6}, d) && tree.node_count() == 3 && tree.parent(d) == a);
+        RECLAIMABLE(1); // B
+        drop(pool, tree, d); RECLAIMABLE(3);
+        // A held first-level edge (no parent to update).
+        BlockId e = make_block(pool, 2);
+        CHECK(tree.insert({7, 7}, e)); RECLAIMABLE(3);
+        drop(pool, tree, e); RECLAIMABLE(4);
+    }
+    {
+        // Splits of edges that hold held blocks.
+        BlockPool pool(12, 2, 1);
+        RadixTree tree(pool);
+        BlockId a = cache(pool, tree, {1, 1});
+        cache(pool, tree, {1, 1, 2, 2});
+        BlockId c = cache(pool, tree, {1, 1, 2, 2, 3, 3});
+        BlockId d = cache(pool, tree, {1, 1, 2, 2, 3, 3, 4, 4});
+        CHECK(tree.node_count() == 1);
+        hold(pool, tree, c); RECLAIMABLE(1); // [A|B|C|D]: only D
+        // A held E splits after A; the held C moves to the tail [B|C|D].
+        BlockId e = make_block(pool, 2);
+        CHECK(tree.insert({1, 1, 9, 9}, e) && tree.node_count() == 3);
+        RECLAIMABLE(1); // still D
+        drop(pool, tree, c); RECLAIMABLE(3); // B, C, D; E holds A
+        drop(pool, tree, e); RECLAIMABLE(5);
+        // A held block before the cut: a cached F splits the tail after B.
+        hold(pool, tree, a); RECLAIMABLE(4);
+        cache(pool, tree, {1, 1, 2, 2, 8, 8});
+        CHECK(tree.node_count() == 5);
+        RECLAIMABLE(5); // only A is stuck
+        hold(pool, tree, d); RECLAIMABLE(2); // [C|D] holds C, B, A: E and F remain
+        drop(pool, tree, a); RECLAIMABLE(2);
+        drop(pool, tree, d); RECLAIMABLE(6);
+    }
+    {
+        // The tail of a split inherits a stuck child: [P|Q|R] -> {[S], [T]}, S held.
+        BlockPool pool(12, 2, 1);
+        RadixTree tree(pool);
+        cache(pool, tree, {5, 5});
+        cache(pool, tree, {5, 5, 6, 6});
+        cache(pool, tree, {5, 5, 6, 6, 7, 7});
+        BlockId s = cache(pool, tree, {5, 5, 6, 6, 7, 7, 8, 8});
+        cache(pool, tree, {5, 5, 6, 6, 7, 7, 9, 9});
+        CHECK(tree.node_count() == 3);
+        hold(pool, tree, s); RECLAIMABLE(1); // T
+        cache(pool, tree, {5, 5, 1, 1}); // [P] -> {[Q|R] -> {S, T}, [U]}
+        CHECK(tree.node_count() == 5);
+        RECLAIMABLE(2); // T, U
+        drop(pool, tree, s); RECLAIMABLE(6);
+    }
+    {
+        // Moves carry the count.
+        BlockPool pool(8, 2, 1);
+        BlockId a, b;
+        {
+            RadixTree tree(pool);
+            a = cache(pool, tree, {1, 1});
+            b = cache(pool, tree, {1, 1, 2, 2});
+            cache(pool, tree, {3, 3});
+            hold(pool, tree, b);
+            RadixTree moved(std::move(tree));
+            CHECK(moved.reclaimable_count() == 1 && moved.check_reclaimable());
+            RadixTree target(pool);
+            cache(pool, target, {4, 4});
+            BlockId x = cache(pool, target, {4, 4, 5, 5});
+            hold(pool, target, x);
+            CHECK(target.reclaimable_count() == 0);
+            target = std::move(moved); // releases {4,4} and x's index reference
+            CHECK(target.reclaimable_count() == 1 && target.check_reclaimable());
+            pool.release(x);
+            drop(pool, target, b);
+            CHECK(target.reclaimable_count() == 3 && target.check_reclaimable());
+        }
+        CHECK(pool.free_count() == pool.capacity() && !pool.allocated(a));
+    }
+}
+
+// Seeded operations against a map from indexed prefix to block. Requests pin
+// matched paths (BlockTable::from_prefix) or single blocks and later let go,
+// calling refresh() as the manager will; the reclaimable count is compared with
+// the scan after every step.
 void random_tests(unsigned seed, std::size_t steps) {
     const std::size_t width = 2;
     BlockPool pool(48, width, 1);
@@ -258,8 +448,13 @@ void random_tests(unsigned seed, std::size_t steps) {
     std::map<Tokens, BlockId> reference;
     std::size_t inserted = 0, refused = 0, erased = 0, blocked = 0, hits = 0;
     std::size_t extends = 0, new_edges = 0, splits = 0, tail_erases = 0, node_erases = 0;
+    std::size_t pins = 0, unpins = 0, holds = 0, drops = 0, held_splits = 0, held_erases = 0;
+    std::size_t max_stuck = 0;
     {
         RadixTree tree(pool);
+        std::vector<std::unique_ptr<BlockTable>> requests; // pinned matched paths
+        std::vector<BlockId> singles;                      // single held blocks
+        std::map<BlockId, std::size_t> holders;            // request references per block
         auto random_tokens = [&](std::size_t blocks) {
             Tokens t(blocks * width);
             for (auto& token : t) token = static_cast<Token>(pick(2)); // small alphabet => sharing
@@ -280,7 +475,7 @@ void random_tests(unsigned seed, std::size_t steps) {
                    std::equal(prefix.begin(), prefix.end(), it->first.begin());
         };
         for (std::size_t step = 0; step < steps; ++step) {
-            auto choice = pick(10);
+            auto choice = pick(13);
             if (choice < 4 && pool.free_count() > 0) {
                 // Extend a matched prefix by one block, like a request filling a block.
                 auto t = random_tokens(1 + pick(6));
@@ -296,7 +491,9 @@ void random_tests(unsigned seed, std::size_t steps) {
                 auto added = tree.node_count() - nodes;
                 CHECK(fresh ? added <= 2 : added == 0);
                 if (fresh) ++(added == 0 ? extends : added == 1 ? new_edges : splits);
+                if (fresh && added == 2 && !holders.empty()) ++held_splits;
                 pool.release(id);
+                tree.refresh(id);
             } else if (choice < 7 && !reference.empty()) {
                 auto it = reference.begin();
                 std::advance(it, pick(reference.size()));
@@ -304,9 +501,44 @@ void random_tests(unsigned seed, std::size_t steps) {
                 CHECK(tree.is_leaf(it->second) == leaf);
                 auto nodes = tree.node_count();
                 CHECK(tree.erase(it->second) == leaf);
+                if (leaf && holders.count(it->second)) ++held_erases;
                 if (leaf) { reference.erase(it); ++erased; } else { ++blocked; }
                 if (leaf) ++(tree.node_count() == nodes ? tail_erases : node_erases);
                 CHECK(nodes - tree.node_count() <= (leaf ? 1u : 0u));
+            } else if (choice == 7 && requests.size() < 4) {
+                // A cache hit pins the matched path, then reports each block.
+                auto ids = tree.match(random_tokens(1 + pick(6)));
+                if (ids.empty()) continue;
+                requests.push_back(std::make_unique<BlockTable>(BlockTable::from_prefix(pool, ids)));
+                for (BlockId id : ids) { ++holders[id]; tree.refresh(id); }
+                ++pins;
+            } else if (choice == 8 && !requests.empty()) {
+                // A request finishes: its table goes first, then each block is reported.
+                auto it = requests.begin() + static_cast<std::ptrdiff_t>(pick(requests.size()));
+                auto ids = (*it)->blocks();
+                requests.erase(it);
+                for (BlockId id : ids) {
+                    if (--holders[id] == 0) holders.erase(id);
+                    tree.refresh(id); // a no-op if the block was erased meanwhile
+                }
+                ++unpins;
+            } else if (choice == 9 && !reference.empty() && singles.size() < 4) {
+                // Any one indexed block, typically in the middle of an edge.
+                auto it = reference.begin();
+                std::advance(it, pick(reference.size()));
+                pool.retain(it->second);
+                ++holders[it->second];
+                singles.push_back(it->second);
+                tree.refresh(it->second);
+                ++holds;
+            } else if (choice == 10 && !singles.empty()) {
+                auto it = singles.begin() + static_cast<std::ptrdiff_t>(pick(singles.size()));
+                BlockId id = *it;
+                singles.erase(it);
+                if (--holders[id] == 0) holders.erase(id);
+                pool.release(id);
+                tree.refresh(id);
+                ++drops;
             } else {
                 auto t = random_tokens(pick(7));
                 if (pick(3) == 0) t.push_back(static_cast<Token>(pick(2))); // partial last block
@@ -316,18 +548,31 @@ void random_tests(unsigned seed, std::size_t steps) {
             }
             CHECK(tree.size() == reference.size());
             CHECK(tree.node_count() <= tree.size());
-            CHECK(pool.free_count() == pool.capacity() - reference.size());
+            std::size_t live = reference.size(); // indexed blocks plus erased-but-held ones
+            for (const auto& entry : holders)
+                if (!tree.contains(entry.first)) ++live;
+            CHECK(pool.free_count() == pool.capacity() - live);
+            for (const auto& entry : holders) CHECK(pool.references(entry.first) >= entry.second);
             for (const auto& entry : reference) {
-                CHECK(pool.references(entry.second) == 1);
+                auto held = holders.count(entry.second) ? holders.at(entry.second) : 0;
+                CHECK(pool.references(entry.second) == 1 + held);
                 auto parent = tree.parent(entry.second);
                 if (entry.first.size() == width) CHECK(!parent);
                 else CHECK(parent == reference.at(Tokens(entry.first.begin(), entry.first.end() - width)));
             }
             CHECK(tree.check_invariants());
+            max_stuck = std::max(max_stuck, tree.size() - reclaimable(pool, tree)); // vs the scan
             if (step % 97 == 0) CHECK(pool.check_invariants());
         }
         CHECK(inserted > 0 && refused > 0 && erased > 0 && blocked > 0 && hits > 0);
         CHECK(extends > 0 && new_edges > 0 && splits > 0 && tail_erases > 0 && node_erases > 0);
+        CHECK(pins > 0 && unpins > 0 && holds > 0 && drops > 0 && held_splits > 0 && held_erases > 0);
+        CHECK(max_stuck > 3);
+        // Let go of everything: every indexed block is reclaimable again.
+        requests.clear();
+        for (BlockId id : singles) pool.release(id);
+        for (BlockId id = 0; id < pool.capacity(); ++id) tree.refresh(id);
+        CHECK(reclaimable(pool, tree) == tree.size());
     }
     CHECK(pool.free_count() == pool.capacity());
 }
@@ -338,8 +583,10 @@ int main() {
         ownership_tests(); std::cout << "PASS radix reference ownership and moves\n";
         compression_tests(); std::cout << "PASS compressed edges: extend, mid-edge match, split, tail erase\n";
         split_ownership_tests(); std::cout << "PASS edge splits keep block IDs, references and pinned requests\n";
+        reclaimable_tests(); std::cout << "PASS reclaimable count: mid-edge holds, splits with held blocks, erases, moves\n";
         for (unsigned seed : {538u, 2026u, 17u}) random_tests(seed, 10000);
-        std::cout << "PASS 30000 seeded radix operations with edge extensions, splits and tail erases\n";
+        std::cout << "PASS 30000 seeded radix operations with edge extensions, splits, tail erases,\n"
+                     "     pins and single holds; reclaimable count equals the scan after every step\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;
