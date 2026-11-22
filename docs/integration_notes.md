@@ -306,3 +306,50 @@ None blocks the integration; the manager works around each one.
 3. Move `using Token` into `types.h`, as the comment in `radix_tree.h` suggests.
 4. An `insert` that takes the parent block and one block of tokens, to avoid copying the
    whole prefix per indexed block.
+
+## 7. Known limitations
+
+### 7.1 A rejected APPEND does not end its request
+
+When an APPEND needs a new block and none is free or evictable, the manager returns
+Reject and changes nothing. The request stays alive with the tokens it had. The driver
+only skips later commands for requests rejected at creation (ADMIT, or FORK as the new
+request, including forks of such a request); a request whose APPEND was rejected keeps
+receiving its later commands.
+
+Consequences:
+
+- The rejected token is lost. Later APPENDs of the same request can succeed once blocks
+  are free again, so the request ends up with a token sequence that has a gap compared
+  with the trace. Its stored bytes are still consistent with the tokens the manager
+  actually accepted (the invariants check this), but they are not the bytes the trace
+  intended.
+- A real server would more likely abort or preempt the request. The current behavior
+  keeps a request that can no longer produce the intended output and lets it hold its
+  blocks until its RELEASE.
+- Blocks filled after the gap are indexed under a prefix that no other request in the
+  trace will ask for, so they add cache content that cannot be hit.
+- `stats.rejected` (the `rejected` CSV column) counts rejected ADMITs, APPENDs and
+  FORKs together. The share of ADMITs accepted is `admitted / admit_ops`, which is what
+  `admitted_vs_capacity.png` plots.
+
+Size of the effect in the sweep (100k-request traces, capacity 256, the only capacity
+with rejections):
+
+| Workload | Sharing | Rejected ADMITs | Rejected APPENDs and FORKs | APPENDs executed |
+|---|---|---|---|---|
+| Unique | off | 22,857 | 62,428 | 2,757,216 |
+| Unique | on | 22,835 | 63,724 | 2,772,141 |
+| System prefix | off | 40,709 | 82,186 | 2,095,021 |
+| System prefix | on | 75 | 733 | 3,604,111 |
+| Multi-turn | off | 10,584 | 39,802 | 3,204,805 |
+| Multi-turn | on | 10,463 | 38,675 | 3,218,228 |
+
+So at capacity 256 roughly 1-4% of executed APPENDs are rejected, except with sharing
+on in the system-prefix workload. Results at capacities 1,024 and 4,096 are not
+affected: nothing is rejected there.
+
+Possible fix, not implemented: have the driver treat a rejected APPEND as the end of
+the request (release it and skip its remaining commands), and report rejected ADMITs
+and aborted requests in separate columns. This changes the capacity-256 results and
+needs the team's agreement on the semantics first.
